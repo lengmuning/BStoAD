@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <RootNamespace>Bstoad.Worker</RootNamespace>
+    <UserSecretsId>bstoad-worker-dev</UserSecretsId>
+    <OutputType>Exe</OutputType>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <AssemblyTitle>BSTOAD 北森→AD 同步</AssemblyTitle>
+    <Product>BSTOAD Beisen-to-AD Sync</Product>
+    <Description>北森 HR 组织架构与员工信息同步到 Active Directory</Description>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="5.0.1" />
+    <PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bstoad.Core\Bstoad.Core.csproj" />
+    <ProjectReference Include="..\Bstoad.Beisen\Bstoad.Beisen.csproj" />
+    <ProjectReference Include="..\Bstoad.ActiveDirectory\Bstoad.ActiveDirectory.csproj" />
+    <ProjectReference Include="..\Bstoad.Sync\Bstoad.Sync.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="appsettings.Development.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!-- 配置模板内嵌进 exe：单文件分发时用 init-config 现场生成 appsettings.json -->
+    <EmbeddedResource Include="appsettings.json" LogicalName="Bstoad.Worker.appsettings.template.json" />
+  </ItemGroup>
+</Project>
