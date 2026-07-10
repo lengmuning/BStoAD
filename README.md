@@ -68,7 +68,19 @@ src/
 └─ Bstoad.Worker/           # CLI 宿主：子命令、DPAPI 凭据加密、退出码、互斥
 ```
 
-## 构建
+## 获取程序
+
+两种方式任选：
+
+### 方式 A · 直接下载（推荐）
+
+到本仓库的 **[Releases](../../releases)** 页面下载最新的 `Bstoad.Worker.exe`（单文件，约 35MB，内含 .NET 运行时，目标服务器**无需安装任何东西**）。每个 Release 由 GitHub Actions 从对应版本源码自动构建并附带 SHA256 校验值，下载后可核验：
+
+```powershell
+Get-FileHash .\Bstoad.Worker.exe -Algorithm SHA256   # 与 Release 页的 .sha256 比对
+```
+
+### 方式 B · 从源码构建
 
 任何装了 .NET 8 SDK 的机器都能出包（含 macOS/Linux 交叉编译 Windows 产物）：
 
@@ -78,7 +90,7 @@ dotnet publish src/Bstoad.Worker -c Release -r win-x64 --self-contained true \
   -p:EnableCompressionInSingleFile=true -o publish
 ```
 
-产出单文件 `Bstoad.Worker.exe`（约 35MB，内含 .NET 运行时），目标服务器**无需安装任何东西**。
+> 维护者发版：`git tag v1.0.0 && git push --tags` 即触发自动构建与 Release 发布（见 `.github/workflows/release.yml`）。
 
 ## 部署指南
 
