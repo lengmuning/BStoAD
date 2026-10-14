@@ -1,6 +1,6 @@
 namespace Bstoad.Worker;
 
-public enum CommandKind { Sync, MatchAd, MigrateMarker, InitConfig, ProtectConfig }
+public enum CommandKind { Sync, MatchAd, MigrateMarker, InitConfig, ProtectConfig, Gui, TestAlert }
 
 public sealed class CommandContext
 {
@@ -32,6 +32,8 @@ public sealed class CommandContext
                 case "migrate-marker": cmd = CommandKind.MigrateMarker; break;
                 case "init-config": cmd = CommandKind.InitConfig; break;
                 case "protect-config": cmd = CommandKind.ProtectConfig; break;
+                case "gui": cmd = CommandKind.Gui; break;
+                case "test-alert": cmd = CommandKind.TestAlert; break;
                 case "--apply": apply = true; break;
                 case "--full": full = true; break;
                 case "--orgs-only": orgsOnly = true; break;
@@ -99,8 +101,11 @@ BSTOAD · 北森 → AD 同步
       单文件分发时的第一步
 
   bstoad protect-config
-      用 DPAPI(本机) 加密配置里的 AppSecret / ServicePassword 并写回
+      用 DPAPI(本机) 加密配置里的密钥、密码、告警 Webhook 并写回
       加密后文件被拷走也无法解密；换服务器需重填明文再跑一次
+
+  bstoad gui        打开图形界面（直接双击 exe 也会打开）
+  bstoad test-alert 向已启用的告警渠道发送一条测试消息
 
   bstoad --help    显示帮助
 

@@ -80,7 +80,7 @@ public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
                     throw new InvalidOperationException(
                         $"Employee/GetByTimeWindow {(int)resp.StatusCode}: {BeisenJson.Truncate(json, 800)}");
 
-                var (page, nextScrollId) = ParsePage(json);
+                var (page, nextScrollId) = ParsePage(json, _options.TitleFields);
 
                 if (page.Count > 0 && !sampleLogged)
                 {
@@ -123,7 +123,7 @@ public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
         return byKey.Values.ToList();
     }
 
-    private static (List<BeisenEmployee>, string? scrollId) ParsePage(string json)
+    private static (List<BeisenEmployee>, string? scrollId) ParsePage(string json, string[] titleFields)
     {
         var list = new List<BeisenEmployee>();
         using var doc = JsonDocument.Parse(json);
@@ -157,8 +157,7 @@ public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
                 OrgId = BeisenJson.GetStr(service, "oIdDepartment", "OIdDepartment", "DepartmentId", "departmentId", "OrgId", "orgId"),
                 OrgName = BeisenJson.GetStr(service, "oIdDepartment_TranslateResult", "OIdDepartment_TranslateResult",
                     "DepartmentName", "departmentName", "OrgName", "orgName"),
-                Title = BeisenJson.GetStr(service, "oIdJobPost_TranslateResult", "OIdJobPost_TranslateResult",
-                    "Position", "position", "Title", "title"),
+                Title = BeisenJson.GetStr(service, titleFields) ?? BeisenJson.GetStr(basic, titleFields),
                 EmpStatus = BeisenJson.GetInt(service, "empStatus", "EmpStatus", "employeeStatus", "EmployeeStatus", "serviceStatus")
                           ?? BeisenJson.GetInt(basic, "empStatus", "EmpStatus", "employeeStatus", "EmployeeStatus") ?? 0,
             };

@@ -1,5 +1,7 @@
 name: Release
 
+# 推送 v* 标签时自动构建单文件 exe 并发布到 GitHub Releases
+# 用法: git tag v1.0.0 && git push --tags
 on:
   push:
     tags: ["v*"]

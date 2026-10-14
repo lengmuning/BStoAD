@@ -66,11 +66,16 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             adReady = false;
             _logger.LogError(ex, "AD 绑定失败，所有 AD 操作将跳过");
             result.Errors.Add("AD bind failed: " + ex.Message);
+            result.AddEvent(SyncEventLevel.Critical, SyncEventCategory.AdBindFailed, _adOpt.LdapHost,
+                _adOpt.LdapHost, "AD 绑定失败，本轮所有 AD 操作已跳过：" + ex.Message);
         }
 
         _logger.LogInformation("[3/6] 拉取全部组织");
         var orgs = await _orgClient.GetAllOrgsAsync(ct);
         result.OrgsFetched = orgs.Count;
+
+        if (_sync.DecodeHtmlEntitiesInNames)
+            foreach (var o in orgs) o.Name = System.Net.WebUtility.HtmlDecode(o.Name);
 
         if (!string.IsNullOrWhiteSpace(_sync.RootOrgId))
         {
@@ -135,11 +140,24 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
                 _logger.LogError("⚠️ 拉取量哨兵：本轮员工 {Now} 条 < 上轮 {Last} 条 × {Ratio:P0}，疑似北森数据源/权限异常——离职差集本轮拒绝执行",
                     emps.Count, last, _sync.MinPullRatioVsLastRun);
                 result.Errors.Add($"pull sentinel: {emps.Count} < {last} x {_sync.MinPullRatioVsLastRun}");
+                result.AddEvent(SyncEventLevel.Critical, SyncEventCategory.PullSentinel, "pull", "员工拉取量",
+                    $"本轮拉到 {emps.Count} 条，上轮 {last} 条，低于 {_sync.MinPullRatioVsLastRun:P0}，疑似北森数据或权限异常，离职差集已拒绝执行");
             }
             else
             {
                 SaveLastFullPullCount(emps.Count);
             }
+        }
+
+        foreach (var e in emps)
+        {
+            if (_sync.DecodeHtmlEntitiesInNames)
+            {
+                e.Name = System.Net.WebUtility.HtmlDecode(e.Name);
+                if (e.OrgName != null) e.OrgName = System.Net.WebUtility.HtmlDecode(e.OrgName);
+                if (e.Title != null) e.Title = System.Net.WebUtility.HtmlDecode(e.Title);
+            }
+            ApplyStatusRules(e);
         }
 
         // 员工侧 department 文本兜底：北森翻译字段缺失时，用组织树的名称按 OrgId 补
@@ -190,6 +208,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             {
                 result.Failures++;
                 result.Errors.Add($"emp {emp.EmployeeId}/{emp.UserId}: {ex.Message}");
+                result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.Failure, "emp:" + emp.EmployeeId,
+                    emp.Name, $"工号 {emp.EmployeeId} 处理失败：{ex.Message}");
                 _logger.LogError(ex, "处理员工失败: {EmpId} {Name}", emp.EmployeeId, emp.Name);
             }
         }
@@ -230,7 +250,38 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             result.UsersDisabled, result.LegacyAdopted, result.ScenarioE, result.LeaversReconciled,
             result.ProtectedSkipped, result.Failures);
         AppendStats(result);
+
+        // 全量、无过滤的运行才代表「全貌」，写出待处理清单供图形界面展示
+        if (_sync.FullPull && !_sync.UsersOnly && only == null && !_sync.LeaversOnly)
+            WritePendingReport(result);
+
         return result;
+    }
+
+    /// <summary>empStatus 业务口径：4 调出 / 6 退休是否按离职处理（默认与 v1.0 一致）。</summary>
+    private void ApplyStatusRules(BeisenEmployee e)
+    {
+        if (e.EmpStatus == 4) e.IsLeaver = _sync.TreatTransferOutAsLeaver;
+        else if (e.EmpStatus == 6) e.IsLeaver = _sync.TreatRetiredAsLeaver;
+    }
+
+    private void WritePendingReport(SyncResult r)
+    {
+        try
+        {
+            var report = new PendingReport { GeneratedAt = DateTime.Now, DryRun = _sync.DryRun, Events = r.Events };
+            var json = System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions
+            {
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+                Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() },
+            });
+            File.WriteAllText(StateFile("pending.json"), json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "写入待处理清单失败（不影响同步）");
+        }
     }
 
     private void EnsureOuRoots()
@@ -316,6 +367,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             {
                 result.Failures++;
                 result.Errors.Add($"OU sync {org.OrgId}/{org.Name}: {ex.Message}");
+                result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.Failure, "ou:" + org.OrgId,
+                    org.Name, $"部门 OU 同步失败（OrgId={org.OrgId}）：{ex.Message}");
                 _logger.LogError(ex, "OU 同步失败: OrgId={OrgId} Name={Name}", org.OrgId, org.Name);
             }
         }
@@ -330,6 +383,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             if (string.IsNullOrEmpty(ou.OrgId)) continue; // 没锚点：手动建的，不管
             if (beisenIds.Contains(ou.OrgId)) continue;   // 北森还有
             result.OrgsAbandoned++;
+            result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.OrgAbandoned, ou.OrgId,
+                ou.Ou, $"北森已不存在该部门（OrgId={ou.OrgId}），OU 留在原地未动", ou.Dn);
             _logger.LogWarning("  [部门撤销] AD OU {Dn} (OrgId={OrgId}) 在北森已不存在 — 留原地不动，请人工 review",
                 ou.Dn, ou.OrgId);
         }
@@ -435,6 +490,10 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
         if (string.IsNullOrWhiteSpace(emp.EmployeeId))
         {
             _logger.LogWarning("跳过：工号为空 userId={UserId} name={Name}", emp.UserId, emp.Name);
+            // 只记录在职人员；离职且无工号的历史数据不打扰
+            if (!emp.IsLeaver)
+                result.AddEvent(SyncEventLevel.Info, SyncEventCategory.EmptyEmployeeId, "uid:" + emp.UserId,
+                    emp.Name, $"北森中该员工没有工号（userId={emp.UserId}），无法建号或匹配，请 HR 补录");
             return;
         }
 
@@ -493,13 +552,19 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             if (AdProtection.IsProtected(byEmpId, _adOpt, out var whyC))
             {
                 result.ProtectedSkipped++;
+                result.AddEvent(SyncEventLevel.Info, SyncEventCategory.Protected, emp.EmployeeId, emp.Name,
+                    $"{whyC}，同步不自动管理，离职时需人工回收", byEmpId.Dn);
                 _logger.LogWarning("  [保护] employeeID={EmpId} 命中受保护账号 {Dn}（{Why}）→ 不动，请人工核实为何该账号带此工号",
                     emp.EmployeeId, byEmpId.Dn, whyC);
                 return;
             }
             if (!NamesRoughlyMatch(byEmpId.DisplayName, emp.Name))
+            {
+                result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.ScenarioDSuspect, emp.EmployeeId, emp.Name,
+                    $"工号 {emp.EmployeeId} 命中的 AD 账号姓名是「{byEmpId.DisplayName}」，与北森「{emp.Name}」不符，请核实是否错填", byEmpId.Dn);
                 _logger.LogWarning("  [场景D嫌疑] employeeID={EmpId} 命中 {Dn}，但 AD 姓名「{Ad}」与北森「{Bs}」不符——继续处理，请人工复核是否错填",
                     emp.EmployeeId, byEmpId.Dn, byEmpId.DisplayName, emp.Name);
+            }
             ApplyExisting(byEmpId, attrs, targetOu, emp, scenarioHint: "C/D/E", result);
             return;
         }
@@ -511,6 +576,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             if (AdProtection.IsProtected(legacy, _adOpt, out var whyA))
             {
                 result.ProtectedSkipped++;
+                result.AddEvent(SyncEventLevel.Info, SyncEventCategory.Protected, emp.EmployeeId, emp.Name,
+                    $"{whyA}，登录名与工号相同但不自动接管", legacy.Dn);
                 _logger.LogWarning("  [保护] SAM={Sam} 命中受保护账号 {Dn}（{Why}）→ 不接管不新建，请人工处理命名冲突",
                     emp.EmployeeId, legacy.Dn, whyA);
                 return;
@@ -519,6 +586,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             {
                 result.Failures++;
                 result.Errors.Add($"场景A拒绝: SAM={emp.EmployeeId} AD姓名「{legacy.DisplayName}」≠北森「{emp.Name}」");
+                result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.ScenarioARejected, emp.EmployeeId, emp.Name,
+                    $"AD 中登录名 {emp.EmployeeId} 的账号姓名是「{legacy.DisplayName}」，与北森不符，未接管", legacy.Dn);
                 _logger.LogError("  [场景A拒绝] SAM={Sam} 撞名但姓名不符：AD「{Ad}」 vs 北森「{Bs}」→ 跳过接管，请人工核实 {Dn}",
                     emp.EmployeeId, legacy.DisplayName, emp.Name, legacy.Dn);
                 return;
@@ -540,11 +609,22 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
 
         // SAM 冲突守卫：employeeID 没匹配上、Legacy 也没接管到，但 SAM 已被占
         // （典型：该账号 employeeID 被错填成别人工号 = 场景 D 的变体）——不能盲建重名账号
+        // 待入职（empStatus=1）是否提前建号：默认建（与 v1.0 一致）
+        if (emp.EmpStatus == 1 && !_sync.CreateAccountForPendingHire)
+        {
+            _logger.LogInformation("  [待入职] {EmpId} {Name} 尚未入职，按规则暂不建号", emp.EmployeeId, emp.Name);
+            result.AddEvent(SyncEventLevel.Info, SyncEventCategory.PendingHireSkipped, emp.EmployeeId, emp.Name,
+                "待入职，按规则暂不建号，入职后自动创建");
+            return;
+        }
+
         var samTaken = _ad.FindUserBySam(attrs.SamAccountName);
         if (samTaken != null)
         {
             result.Failures++;
             result.Errors.Add($"SAM 冲突: {attrs.SamAccountName} 已被 {samTaken.Dn} 占用 (其 employeeID={samTaken.EmployeeId})");
+            result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.SamConflict, emp.EmployeeId, emp.Name,
+                $"登录名 {attrs.SamAccountName} 已被其他账号占用（其 employeeID={samTaken.EmployeeId}），未新建", samTaken.Dn);
             _logger.LogError("  [SAM冲突] {Sam} 已被 {Dn} 占用，其 employeeID={EmpId}（疑似错填）→ 跳过新建，请人工核对",
                 attrs.SamAccountName, samTaken.Dn, samTaken.EmployeeId);
             return;
@@ -573,11 +653,33 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             if (!_sync.DryRun) newDn = _ad.MoveUser(existing.Dn, targetOu, attrs.EmployeeId);
             result.UsersMoved++;
             result.ScenarioE++;
+            if (existing.IsDisabled)
+                result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.ScenarioE, emp.EmployeeId, emp.Name,
+                    "北森显示在职，账号已从离职 OU 移回部门，但仍是禁用状态，请确认后手动启用", newDn);
         }
         else if (!string.Equals(currentOu, targetOu, StringComparison.OrdinalIgnoreCase))
         {
             _logger.LogInformation("  [场景{Sc}/Move] {Dn} → {Ou}", scenarioHint, existing.Dn, targetOu);
-            if (!_sync.DryRun) newDn = _ad.MoveUser(existing.Dn, targetOu, attrs.EmployeeId);
+            if (!_sync.DryRun)
+            {
+                if (emp.IsLeaver && _sync.DisableLeaverEvenIfMoveFails)
+                {
+                    // 离职账号：移动失败不能连带禁用失败——禁用比归档位置更重要
+                    try { newDn = _ad.MoveUser(existing.Dn, targetOu, attrs.EmployeeId); }
+                    catch (Exception ex)
+                    {
+                        result.Failures++;
+                        result.Errors.Add($"leaver move {existing.Dn}: {ex.Message}");
+                        result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.Failure, "move:" + emp.EmployeeId, emp.Name,
+                            $"离职账号移到离职 OU 失败，已在原位置禁用：{ex.Message}", existing.Dn);
+                        _logger.LogError(ex, "  离职账号移动失败，改为原位置禁用: {Dn}", existing.Dn);
+                    }
+                }
+                else
+                {
+                    newDn = _ad.MoveUser(existing.Dn, targetOu, attrs.EmployeeId);
+                }
+            }
             result.UsersMoved++;
         }
         else
@@ -628,6 +730,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
         {
             result.Failures++;
             result.Errors.Add($"差集熔断: 拟处理 {candidates.Count} > 上限 {limit}");
+            result.AddEvent(SyncEventLevel.Critical, SyncEventCategory.CircuitBreaker, "reconcile", "离职差集",
+                $"本轮拟禁用 {candidates.Count} 个账号，超过上限 {limit}，差集已中止，请核实北森数据是否正常");
             _logger.LogError(
                 "⚠️ 差集熔断：本轮拟归档/禁用 {C} 个账号，超过上限 {L}（=max(MaxLeaversPerRun={A}, 纳管{M}×{R:P0})）——差集中止。请人工核实北森数据/权限正常后再跑",
                 candidates.Count, limit, _sync.MaxLeaversPerRun, managed.Count, _sync.MaxLeaverRatio);
@@ -639,6 +743,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             if (AdProtection.IsProtected(m, _adOpt, out var why))
             {
                 result.ProtectedSkipped++;
+                result.AddEvent(SyncEventLevel.Info, SyncEventCategory.Protected, m.EmployeeId ?? m.Dn,
+                    m.DisplayName ?? m.SamAccountName, $"{why}，北森已无此在职人员但不自动禁用，请人工回收", m.Dn);
                 _logger.LogWarning("  [保护] 差集命中受保护账号 {Dn}（{Why}）→ 不动", m.Dn, why);
                 continue;
             }
@@ -649,7 +755,26 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             {
                 try
                 {
-                    var newDn = alreadyInLeaverOu ? m.Dn : _ad.MoveUser(m.Dn, _adOpt.LeaverOu, m.EmployeeId);
+                    var newDn = m.Dn;
+                    if (!alreadyInLeaverOu)
+                    {
+                        if (_sync.DisableLeaverEvenIfMoveFails)
+                        {
+                            try { newDn = _ad.MoveUser(m.Dn, _adOpt.LeaverOu, m.EmployeeId); }
+                            catch (Exception mex)
+                            {
+                                result.Failures++;
+                                result.Errors.Add($"leaver move {m.Dn}: {mex.Message}");
+                                result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.Failure, "move:" + m.EmployeeId,
+                                    m.DisplayName ?? m.SamAccountName, $"移到离职 OU 失败，已在原位置禁用：{mex.Message}", m.Dn);
+                                _logger.LogError(mex, "差集移动失败，改为原位置禁用: {Dn}", m.Dn);
+                            }
+                        }
+                        else
+                        {
+                            newDn = _ad.MoveUser(m.Dn, _adOpt.LeaverOu, m.EmployeeId);
+                        }
+                    }
                     if (!m.IsDisabled) _ad.DisableUser(newDn);
                     result.LeaversReconciled++;
                 }
@@ -657,6 +782,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
                 {
                     result.Failures++;
                     result.Errors.Add($"leaver {m.Dn}: {ex.Message}");
+                    result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.Failure, "leaver:" + m.EmployeeId,
+                        m.DisplayName ?? m.SamAccountName, $"离职处理失败，账号可能仍处于启用状态：{ex.Message}", m.Dn);
                     _logger.LogError(ex, "差集处理失败: {Dn}", m.Dn);
                 }
             }
@@ -678,6 +805,8 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
                 {
                     result.Failures++;
                     result.Errors.Add($"leaver-sweep {u.Dn}: {ex.Message}");
+                    result.AddEvent(SyncEventLevel.Warning, SyncEventCategory.Failure, "sweep:" + u.Dn,
+                        u.DisplayName ?? u.SamAccountName, $"离职 OU 中的账号禁用失败：{ex.Message}", u.Dn);
                     continue;
                 }
             }

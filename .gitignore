@@ -1,0 +1,16 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+*.DotSettings.user
+appsettings.Local.json
+appsettings.*.Local.json
+secrets/
+*.pfx
+*.log
+logs/
+state/
+.DS_Store

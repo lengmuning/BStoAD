@@ -3,11 +3,23 @@ using Bstoad.Beisen;
 using Bstoad.Core.Options;
 using Bstoad.Sync;
 using Bstoad.Worker;
+using Bstoad.Worker.Alerts;
+using Bstoad.Worker.Gui;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Serilog;
 using Serilog.Events;
+
+// 输出被重定向时（图形界面「运行」页、PowerShell 管道）统一用 UTF-8，避免中文乱码
+if (Console.IsOutputRedirected)
+{
+    try { Console.OutputEncoding = new System.Text.UTF8Encoding(false); } catch { /* 忽略 */ }
+}
+
+// 不带参数（双击 exe）或 gui → 图形界面；带参数 → 原有命令行（计划任务走这里，行为不变）
+if (args.Length == 0 || (args.Length == 1 && args[0] == "gui"))
+    return GuiEntry.Run();
 
 var ctx = CommandContext.Parse(args);
 
@@ -22,7 +34,7 @@ var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
 if (!File.Exists(configPath))
 {
     Console.Error.WriteLine($"未找到配置文件: {configPath}");
-    Console.Error.WriteLine("请先运行: Bstoad.Worker.exe init-config 生成模板，填好 4 个占位符后再执行其他命令。");
+    Console.Error.WriteLine("请先运行: Bstoad.Worker.exe init-config 生成模板（或双击 exe 用图形界面配置）。");
     return 2;
 }
 
@@ -32,6 +44,9 @@ if (ctx.Command == CommandKind.ProtectConfig)
     ConfigProtector.Run(configPath);
     return 0;
 }
+
+if (ctx.Command == CommandKind.TestAlert)
+    return await TestAlertCommand.RunAsync(configPath);
 
 // 进程互斥：防止定时任务重叠（如 02:00 全量未跑完，02:07 增量又启动）导致并发写 AD
 using var instanceMutex = new Mutex(initiallyOwned: true, @"Global\BSTOAD-Worker", out var mutexOwned);
@@ -73,6 +88,12 @@ builder.Services.AddSerilog();
 builder.Services.AddBeisenClients(builder.Configuration);
 builder.Services.AddActiveDirectory(builder.Configuration);
 builder.Services.AddSyncOrchestration(builder.Configuration);
+
+// 告警（默认关闭；失败不影响同步）
+builder.Services.Configure<AlertOptions>(builder.Configuration.GetSection(AlertOptions.SectionName));
+builder.Services.PostConfigure<AlertOptions>(AlertSecrets.Decrypt);
+builder.Services.AddSingleton<AlertSender>();
+builder.Services.AddSingleton<IAlertService, AlertService>();
 
 // 透明解密 protect-config 加密过的凭据（明文值原样通过）
 builder.Services.PostConfigure<BeisenOptions>(o => o.AppSecret = ConfigProtector.Unprotect(o.AppSecret));

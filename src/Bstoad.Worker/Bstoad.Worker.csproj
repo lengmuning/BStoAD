@@ -3,11 +3,16 @@
     <RootNamespace>Bstoad.Worker</RootNamespace>
     <UserSecretsId>bstoad-worker-dev</UserSecretsId>
     <OutputType>Exe</OutputType>
+    <!-- v1.1 起内置图形界面（双击 exe 打开）；带参数运行仍是命令行，计划任务不受影响 -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <AssemblyTitle>BSTOAD 北森→AD 同步</AssemblyTitle>
     <Product>BSTOAD Beisen-to-AD Sync</Product>
     <Description>北森 HR 组织架构与员工信息同步到 Active Directory</Description>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
@@ -15,6 +20,9 @@
     <PackageReference Include="Serilog.Sinks.Console" Version="5.0.1" />
     <PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="app.ico" LogicalName="Bstoad.Worker.app.ico" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Bstoad.Core\Bstoad.Core.csproj" />

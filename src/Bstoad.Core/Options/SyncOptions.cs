@@ -41,4 +41,16 @@ public sealed class SyncOptions
     public double MaxLeaverRatio { get; set; } = 0.05;
     // 拉取量哨兵：全量员工数低于上一轮的该比例时，视为数据源异常，拒绝跑差集
     public double MinPullRatioVsLastRun { get; set; } = 0.7;
+
+    // ---- 业务规则开关（v1.1 起；默认值 = v1.0 的行为，升级不改变任何结果）----
+    // empStatus=4「调出」是否按离职处理
+    public bool TreatTransferOutAsLeaver { get; set; } = true;
+    // empStatus=6「退休」是否按离职处理
+    public bool TreatRetiredAsLeaver { get; set; } = false;
+    // empStatus=1「待入职」是否提前建号
+    public bool CreateAccountForPendingHire { get; set; } = true;
+    // 离职账号移动到离职 OU 失败时，是否仍在原位置禁用（更安全）
+    public bool DisableLeaverEvenIfMoveFails { get; set; } = false;
+    // 把北森名称里的 HTML 实体（&amp; 等）还原成正常字符（开启后对应 OU 会被改名一次）
+    public bool DecodeHtmlEntitiesInNames { get; set; } = false;
 }

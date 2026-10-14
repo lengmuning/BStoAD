@@ -35,6 +35,13 @@ public sealed class BeisenOptions
     // 默认关闭；仅在排查字段映射问题时临时开启，排查完立即关闭并清理日志。
     public bool LogRawSamples { get; set; } = false;
 
+    // 职位字段的候选键（按顺序取第一个非空值）。北森租户字段命名不一时在此调整，无需重新出包
+    public string[] TitleFields { get; set; } =
+    {
+        "oIdJobPost_TranslateResult", "OIdJobPost_TranslateResult", "jobPostName", "JobPostName",
+        "positionName", "PositionName", "Position", "position", "Title", "title", "jobTitle",
+    };
+
     public DateTime FullPullStartUtc()
     {
         if (DateTime.TryParse(FullPullStartDate, out var d))

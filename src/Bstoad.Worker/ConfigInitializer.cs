@@ -16,10 +16,7 @@ public static class ConfigInitializer
             return;
         }
 
-        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(TemplateResourceName)
-            ?? throw new InvalidOperationException("未找到内嵌配置模板: " + TemplateResourceName);
-        using var file = File.Create(target);
-        stream.CopyTo(file);
+        WriteTemplate(target);
 
         Console.WriteLine($"已生成配置模板: {target}");
         Console.WriteLine();
@@ -30,5 +27,13 @@ public static class ConfigInitializer
         Console.WriteLine("建议随后收紧文件权限:");
         Console.WriteLine("  icacls appsettings.json /inheritance:r");
         Console.WriteLine("  icacls appsettings.json /grant \"SYSTEM:R\" \"Administrators:F\"");
+    }
+
+    public static void WriteTemplate(string target)
+    {
+        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(TemplateResourceName)
+            ?? throw new InvalidOperationException("未找到内嵌配置模板: " + TemplateResourceName);
+        using var file = File.Create(target);
+        stream.CopyTo(file);
     }
 }

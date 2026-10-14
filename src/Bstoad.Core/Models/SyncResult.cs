@@ -17,5 +17,9 @@ public sealed class SyncResult
     public int ProtectedSkipped { get; set; }
     public int Failures { get; set; }
     public List<string> Errors { get; } = new();
+    public List<SyncEvent> Events { get; } = new();
     public TimeSpan Duration { get; set; }
+
+    public void AddEvent(SyncEventLevel level, string category, string key, string name, string detail, string? dn = null)
+        => Events.Add(new SyncEvent { Level = level, Category = category, Key = key, Name = name, Detail = detail, Dn = dn });
 }
