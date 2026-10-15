@@ -178,7 +178,15 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             }
             if (emps.Count == 0)
                 throw new EventLookupUnavailableException(
-                    $"按 userId 查询 {evt.UserIds.Count} 人，北森没有返回任何员工（接口路径或参数可能不对，可用 probe-employee 核对）");
+                    $"按 userId 查询 {evt.UserIds.Count} 人，北森没有返回任何员工（接口路径、权限或查询列可能不对，可用 probe-employee 核对）");
+            // 结构性问题（查询列不全、字段名变化）宁可回退时间窗也不能带病处理：
+            // 缺任职信息会让所有人被当作「工号为空」跳过；状态解析失败会漏掉禁用离职员工
+            if (emps.All(e => string.IsNullOrEmpty(e.EmployeeId) && string.IsNullOrEmpty(e.OrgId)))
+                throw new EventLookupUnavailableException("按 userId 查询返回的数据缺少任职信息（工号、部门），可用 probe-employee 核对查询列");
+            var badStatus = emps.Where(e => e.EmpStatus == 0).Select(e => e.UserId).ToList();
+            if (badStatus.Count > 0)
+                throw new EventLookupUnavailableException(
+                    $"按 userId 查询返回的人员状态无法识别（userId={string.Join(",", badStatus.Take(5))}），可用 probe-employee 核对");
         }
         else
         {

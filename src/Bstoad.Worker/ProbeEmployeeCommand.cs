@@ -38,38 +38,49 @@ public static class ProbeEmployeeCommand
         var o = sp.GetRequiredService<IOptions<BeisenOptions>>().Value;
         var client = sp.GetRequiredService<IBeisenEmployeeClient>();
 
-        Console.WriteLine($"接口: POST {o.BaseUrl.TrimEnd('/')}{o.EmployeeByIdsPath}");
-        Console.WriteLine($"参数: {o.EmployeeByIdsParam} = [{string.Join(",", userIds)}]（按{(o.EmployeeByIdsAsNumbers ? "数字" : "字符串")}发送）" +
-                          "，另带 IsWithDeleted=true、EnableTranslate=true" +
-                          (o.EmployeeByIdsExtraParams.Count > 0 ? "、" + string.Join("、", o.EmployeeByIdsExtraParams.Keys) : ""));
-
-        var (status, body) = await client.ProbeByUserIdsAsync(userIds);
-        Console.WriteLine($"HTTP {status}");
-        Console.WriteLine();
-        Console.WriteLine("── 响应结构（值已隐去，可以放心转发）──");
-        Console.WriteLine(DescribeShape(body));
-
-        if (status is >= 200 and < 300)
+        Console.WriteLine("按 userId 精确查询 = 员工信息 + 任职记录两个接口，按 userID 合并。");
+        var probe = await client.ProbeByUserIdsAsync(userIds);
+        var allOk = true;
+        foreach (var call in probe.Calls)
         {
-            var emps = client.ParseEmployees(body);
             Console.WriteLine();
-            Console.WriteLine($"── 解析结果（含个人信息，仅本机查看）：{emps.Count} 名员工 ──");
-            foreach (var e in emps)
-                Console.WriteLine($"  userId={e.UserId}  工号={e.EmployeeId}  姓名={e.Name}  部门={e.OrgName ?? e.OrgId}  状态={e.EmpStatus}");
-            var missing = userIds.Distinct().Where(id => emps.All(e => e.UserId != id)).ToList();
-            if (missing.Count > 0) Console.WriteLine("  未返回的 userId: " + string.Join(",", missing));
-
-            Console.WriteLine();
-            if (emps.Count > 0 && missing.Count == 0 && emps.All(e => !string.IsNullOrEmpty(e.EmployeeId)))
-            {
-                Console.WriteLine("✓ 接口可用：可以在图形界面「事件订阅」页把员工查询方式切换为「按 userId 精确查询」，保存后重启事件监听。");
-                return 0;
-            }
+            Console.WriteLine($"── {call.Label}：POST {o.BaseUrl.TrimEnd('/')}{call.Path} ──");
+            Console.WriteLine($"请求: {call.RequestBody}");
+            Console.WriteLine($"HTTP {call.Status}");
+            Console.WriteLine("响应结构（值已隐去，可以放心转发）：");
+            Console.WriteLine(DescribeShape(call.Body));
+            if (call.Status is < 200 or >= 300 || call.Body.Contains("\"code\":\"4", StringComparison.Ordinal) ||
+                call.Body.Contains("\"code\":\"5", StringComparison.Ordinal))
+                allOk = false;
         }
 
+        var emps = probe.Employees;
         Console.WriteLine();
-        Console.WriteLine("✗ 接口不可用或返回不完整。可调整 appsettings.json 的 Beisen.EmployeeByIdsPath / EmployeeByIdsParam / " +
-                          "EmployeeByIdsAsNumbers 后重试；在此之前请保持「按时间窗回查」。");
+        Console.WriteLine($"── 合并解析结果（含个人信息，仅本机查看）：{emps.Count} 名员工 ──");
+        foreach (var e in emps)
+            Console.WriteLine($"  userId={e.UserId}  工号={e.EmployeeId}  姓名={e.Name}  邮箱={(string.IsNullOrEmpty(e.Email) ? "<空>" : "有")}  " +
+                              $"手机={(string.IsNullOrEmpty(e.Mobile) ? "<空>" : "有")}  部门OrgId={e.OrgId}  人员状态={e.EmpStatus}");
+        var requested = userIds.Where(id => int.TryParse(id, out var n) && n > 0).Distinct().ToList();
+        var missing = requested.Where(id => emps.All(e => e.UserId != id)).ToList();
+        if (missing.Count > 0) Console.WriteLine("  未返回（两个接口没有同时查到）: " + string.Join(",", missing));
+
+        var problems = new List<string>();
+        if (!allOk) problems.Add("有接口返回错误（看上面的 HTTP 状态和 code / message）");
+        if (emps.Count == 0) problems.Add("没有解析出任何员工");
+        if (emps.Any(e => string.IsNullOrEmpty(e.EmployeeId))) problems.Add("有员工缺少工号（任职记录的查询列或权限不全）");
+        if (emps.Any(e => e.EmpStatus == 0)) problems.Add("有员工的人员状态无法识别");
+        if (emps.Any(e => string.IsNullOrEmpty(e.Name))) problems.Add("有员工缺少姓名（员工信息的查询列或权限不全）");
+
+        Console.WriteLine();
+        if (problems.Count == 0 && missing.Count == 0)
+        {
+            Console.WriteLine("✓ 接口可用：可以在图形界面「事件订阅」页把员工查询方式切换为「按 userId 精确查询」，保存后重启事件监听。");
+            Console.WriteLine("  说明：北森已下线接口内的名称翻译，部门名称由组织树补齐；职位名称在每日全量同步时更新。");
+            return 0;
+        }
+        foreach (var p in problems) Console.WriteLine("✗ " + p);
+        if (problems.Count == 0) Console.WriteLine("✗ 部分 userId 未返回：确认这些 userId 存在且未被删除（已删除的员工不会返回）");
+        Console.WriteLine("  在此之前请保持「按时间窗回查」。可把上面两段「响应结构」发给维护人员排查（不要发「合并解析结果」）。");
         return 2;
     }
 

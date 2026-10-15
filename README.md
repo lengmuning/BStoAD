@@ -119,7 +119,7 @@ webhook/                    # 北森事件接收端（Linux，独立部署；Pyt
 
 - **北森事件只是通知**（谁、什么类型），不带员工数据。监听收到后回查北森，走与定时同步**完全相同**的决策树、纳管标记与安全阀。两种查法（「事件订阅」页选择）：
   - **按时间窗回查**（默认）：以「本批最早事件时间 − 10 分钟」为起点，与每小时增量同一个接口；需等 90 秒让北森「修改时间」落库。
-  - **按 userId 精确查询**（v1.3）：用事件里的 userId 直接查这几个人，合并等待只需 10 秒。接口先用 `probe-employee` 核对；查询失败时这批自动改用时间窗，连续失败 3 次则本次运行不再尝试。
+  - **按 userId 精确查询**（v1.3.1）：用事件里的 userId 调用北森 `GetBasicInfoByIds`（姓名、邮箱、手机、座机）+ `GetServiceInfoByIds`（当前生效主职：工号、部门、职位、人员状态）两个接口并按 userID 合并，合并等待只需 10 秒。启用前用 `probe-employee` 核对（连接器需有员工信息、任职记录两个对象的权限）；查询失败或数据不全时这批自动改用时间窗，连续失败 3 次则本次运行不再尝试。北森 v5 已下线接口内翻译，部门名称由组织树补齐，职位名称在每日全量时更新。
 - **轻量**（v1.3）：组织树缓存 2 小时（只缓存北森组织树，OU 每批按锚点现查，不会因夜间全量改名而过期；遇新部门 / 组织事件即刷新），员工事件不再每批整棵拉取组织树（数十次接口调用）；拉取接口支持**长轮询**，事件到达即返回；日志记录「事件 userId → 工号 姓名」对应关系。
 - **域控零入站**：事件接收端放在 DMZ / 能被北森访问的服务器上；BSTOAD 主动出站拉取，域控不需要开放任何端口。
 - **合并**：收到事件后等一会儿（时间窗 90 秒 / 按 userId 10 秒）没有新事件再同步，HR 的一组连续操作只触发一次。HR 连续操作超过 5 分钟被迫提前处理时，会在 90 秒后自动补查一次，补上当时北森还查不到的变更。
@@ -331,7 +331,7 @@ Import-Csv C:\bstoad\state\stats.csv | Select-Object -Last 5 | Format-Table
 | `Sync.HourlyIncrementalEnabled` | 是否运行每小时增量任务（默认是；关闭后由图形界面停用 `BSTOAD-Sync`） |
 | `EventFeed.SettleSeconds` 等 | 合并等待（默认 90 秒，需大于 `Sync.TimeWindowSafetyOffsetSeconds`+15）、轮询间隔、告警阈值 |
 | `EventFeed.LookupMode` | `TimeWindow`（默认）或 `ById`；`ByIdSettleSeconds`、`OrgCacheMinutes`、`LongPollSeconds`、`MaxMemoryMB` 见配置模板 |
-| `Beisen.EmployeeByIds*` | 按 userId 查询的接口路径、ID 参数名、ID 是否按数字发送（先用 `probe-employee` 核对） |
+| `Beisen.EmployeeBasicByIds* / EmployeeServiceByIds*` | 按 userId 查询的两个接口路径、查询列、任职记录选项（默认当前生效主职） |
 
 ## 运维
 
@@ -366,6 +366,11 @@ Import-Csv C:\bstoad\state\stats.csv | Select-Object -Last 5 | Format-Table
 - 员工接口的字段解析采用多候选键容错，不同租户如字段命名差异可通过日志样本比对调整
 
 ## 更新日志
+
+**v1.3.1**
+- 按 userId 精确查询改用北森确认的两个接口：`Employee/GetBasicInfoByIds` + `Employee/GetServiceInfoByIds`（option=CurrentEffectiveMainJob），按 userID 合并；`probe-employee` 同时核对两个接口
+- 按 userId 查询返回的数据缺任职信息、或人员状态无法识别时，自动回退时间窗（不带病处理）
+- 解析：座机读取 `officeTel`（此前未读取，AD 电话号码可能一直为空）；人员状态兼容枚举名；部门 / 职位名称兼容 `translateProperties`
 
 **v1.3.0** 轻量化
 - 写 AD 只改有差异的属性，纳管标记合并到同一次写入；「更新」计数改为真实改动数（夜间全量从重写全员降到只写差异）

@@ -29,13 +29,17 @@ public sealed class BeisenOptions
     public Dictionary<string, string> OrgExtraParams { get; set; } = new();
     public Dictionary<string, string> EmployeeExtraParams { get; set; } = new();
 
-    // 按 userId 精确查询员工（v1.3；事件订阅「按 userId 精确查询」时使用）。
-    // 该接口未在本工具适配过的租户上验证：路径、ID 参数名、ID 类型都做成配置，先用 probe-employee 命令核对再启用。
-    public string EmployeeByIdsPath { get; set; } = "/TenantBaseExternal/api/v5/Employee/GetByIds";
-    public string EmployeeByIdsParam { get; set; } = "ids";
-    // true = ID 按数字发送 [645506318]；false = 按字符串 ["645506318"]
-    public bool EmployeeByIdsAsNumbers { get; set; } = true;
-    public Dictionary<string, string> EmployeeByIdsExtraParams { get; set; } = new();
+    // 按 userId 精确查询员工（v1.3.1；事件订阅「按 userId 精确查询」时使用）。北森把一个人的数据分在两个接口里：
+    // 员工信息（姓名、邮箱、手机、座机）与任职记录（工号、部门、职位、人员状态），按 userID 合并。请求体 {oIds:[int], columns:[...]}。
+    public string EmployeeBasicByIdsPath { get; set; } = "/TenantBaseExternal/api/v5/Employee/GetBasicInfoByIds";
+    public string EmployeeServiceByIdsPath { get; set; } = "/TenantBaseExternal/api/v5/Employee/GetServiceInfoByIds";
+    // 查询列必须显式列出：员工信息接口的默认查询列只有 UserID、审批状态
+    public string[] EmployeeBasicByIdsColumns { get; set; } = { "UserID", "Name", "Email", "MobilePhone", "OfficeTel" };
+    public string[] EmployeeServiceByIdsColumns { get; set; } =
+        { "UserID", "JobNumber", "OIdDepartment", "OIdJobPost", "EmployeeStatus", "EmployType", "ServiceType", "IsCurrentRecord" };
+    // 取哪条任职记录：CurrentEffectiveMainJob = 当前生效的主职（提前录入、尚未生效的调动 / 离职不会提前作用到 AD）；
+    // LatestEffectiveMainJob = 最新主职；None = 按其他条件查询
+    public string EmployeeServiceByIdsOption { get; set; } = "CurrentEffectiveMainJob";
 
     public int TokenRefreshSkewSeconds { get; set; } = 300;
 

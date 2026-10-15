@@ -1,12 +1,19 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Bstoad.Core.Models;
 using Bstoad.Core.Options;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Bstoad.Beisen;
+
+/// <summary>probe-employee 的一次接口调用（原始响应，未解析）。</summary>
+public sealed record ByIdsProbeCall(string Label, string Path, string RequestBody, int Status, string Body);
+
+/// <summary>probe-employee 的结果：两个接口的原始响应 + 合并解析出的员工。</summary>
+public sealed record ByIdsProbeResult(IReadOnlyList<ByIdsProbeCall> Calls, IReadOnlyList<BeisenEmployee> Employees);
 
 public interface IBeisenEmployeeClient
 {
@@ -17,14 +24,14 @@ public interface IBeisenEmployeeClient
     Task<IReadOnlyList<BeisenEmployee>> SearchByTimeWindowAsync(
         DateTime startUtc, DateTime stopUtc, bool includeDeleted, CancellationToken ct = default);
 
-    /// <summary>按 userId 精确查询（接口与参数见 BeisenOptions.EmployeeByIds*）。HTTP 失败时抛异常。</summary>
+    /// <summary>
+    /// 按 userId 精确查询：员工信息 + 任职记录两个接口，按 userID 合并（两边都查到的才返回）。
+    /// HTTP 失败或北森返回业务错误码时抛异常。
+    /// </summary>
     Task<IReadOnlyList<BeisenEmployee>> GetByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default);
 
-    /// <summary>probe-employee 用：发与 GetByUserIdsAsync 相同的请求，返回 HTTP 状态与原始响应，不解析、不抛 HTTP 错误。</summary>
-    Task<(int Status, string Body)> ProbeByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default);
-
-    /// <summary>按与时间窗接口相同的规则解析响应（供 probe-employee 展示解析结果）。</summary>
-    IReadOnlyList<BeisenEmployee> ParseEmployees(string json);
+    /// <summary>probe-employee 用：发与 GetByUserIdsAsync 相同的请求，返回原始响应与合并解析结果，不抛 HTTP 错误。</summary>
+    Task<ByIdsProbeResult> ProbeByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default);
 }
 
 public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
@@ -134,45 +141,110 @@ public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
 
     public async Task<IReadOnlyList<BeisenEmployee>> GetByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default)
     {
-        var byKey = new Dictionary<string, BeisenEmployee>(StringComparer.Ordinal);
-        foreach (var chunk in userIds.Distinct(StringComparer.Ordinal).Chunk(Math.Clamp(_options.PageCapacity, 1, 300)))
+        var result = new List<BeisenEmployee>();
+        foreach (var chunk in ValidIds(userIds).Chunk(300)) // 两个接口都要求 ID 个数 ≤ 300
         {
-            var (status, json) = await PostByIdsAsync(chunk, ct);
-            if (status < 200 || status >= 300)
-                throw new InvalidOperationException($"{_options.EmployeeByIdsPath} {status}: {BeisenJson.Truncate(json, 800)}");
-            var (page, _) = ParsePage(json, _options.TitleFields);
-            foreach (var e in page)
-                byKey[!string.IsNullOrEmpty(e.UserId) ? e.UserId : e.EmployeeId] = e;
+            var basic = await PostByIdsAsync(_options.EmployeeBasicByIdsPath, chunk, _options.EmployeeBasicByIdsColumns, option: null, ct);
+            EnsureSuccess(_options.EmployeeBasicByIdsPath, basic.Status, basic.Body);
+            var service = await PostByIdsAsync(_options.EmployeeServiceByIdsPath, chunk, _options.EmployeeServiceByIdsColumns,
+                _options.EmployeeServiceByIdsOption, ct);
+            EnsureSuccess(_options.EmployeeServiceByIdsPath, service.Status, service.Body);
+            result.AddRange(ParsePage(MergeBasicAndService(basic.Body, service.Body), _options.TitleFields).Item1);
         }
-        return byKey.Values.ToList();
+        return result;
     }
 
-    public Task<(int Status, string Body)> ProbeByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default)
-        => PostByIdsAsync(userIds.ToArray(), ct);
+    public async Task<ByIdsProbeResult> ProbeByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default)
+    {
+        var ids = ValidIds(userIds).Take(300).ToArray();
+        var basic = await PostByIdsAsync(_options.EmployeeBasicByIdsPath, ids, _options.EmployeeBasicByIdsColumns, option: null, ct);
+        var service = await PostByIdsAsync(_options.EmployeeServiceByIdsPath, ids, _options.EmployeeServiceByIdsColumns,
+            _options.EmployeeServiceByIdsOption, ct);
+        var calls = new List<ByIdsProbeCall>
+        {
+            new("员工信息", _options.EmployeeBasicByIdsPath, basic.RequestBody, basic.Status, basic.Body),
+            new("任职记录", _options.EmployeeServiceByIdsPath, service.RequestBody, service.Status, service.Body),
+        };
+        IReadOnlyList<BeisenEmployee> employees = Array.Empty<BeisenEmployee>();
+        if (IsSuccess(basic.Status, basic.Body) && IsSuccess(service.Status, service.Body))
+            employees = ParsePage(MergeBasicAndService(basic.Body, service.Body), _options.TitleFields).Item1;
+        return new ByIdsProbeResult(calls, employees);
+    }
 
-    public IReadOnlyList<BeisenEmployee> ParseEmployees(string json) => ParsePage(json, _options.TitleFields).Item1;
+    /// <summary>北森 userID 是正整数（接口参数为 int32 数组）；非数字的 ID 直接丢弃。</summary>
+    private static IEnumerable<string> ValidIds(IEnumerable<string> userIds) =>
+        userIds.Where(id => int.TryParse(id, out var n) && n > 0).Distinct(StringComparer.Ordinal);
 
-    private async Task<(int Status, string Body)> PostByIdsAsync(IReadOnlyCollection<string> ids, CancellationToken ct)
+    private async Task<(string RequestBody, int Status, string Body)> PostByIdsAsync(
+        string path, IReadOnlyCollection<string> ids, string[] columns, string? option, CancellationToken ct)
     {
         var token = await _tokenProvider.GetAccessTokenAsync(ct);
         var client = _httpClientFactory.CreateClient(nameof(BeisenEmployeeClient));
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-        object idList = _options.EmployeeByIdsAsNumbers
-            ? ids.Select(id => long.TryParse(id, out var n) ? (object)n : id).ToArray()
-            : ids.ToArray();
         var body = new Dictionary<string, object?>
         {
-            [_options.EmployeeByIdsParam] = idList,
-            ["IsWithDeleted"] = true,
-            ["EnableTranslate"] = true,
+            ["oIds"] = ids.Select(int.Parse).ToArray(),
+            ["isWithDeleted"] = false, // 已删除的员工不建号、不改号；查不到时由每日全量处理
+            ["columns"] = columns.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
         };
-        foreach (var kv in _options.EmployeeByIdsExtraParams)
-            body[kv.Key] = BeisenJson.ParseConfigValue(kv.Value);
+        if (!string.IsNullOrWhiteSpace(option)) body["option"] = option;
+        var requestBody = JsonSerializer.Serialize(body);
 
-        var url = new Uri(new Uri(_options.BaseUrl), _options.EmployeeByIdsPath);
-        using var resp = await client.PostAsJsonAsync(url, body, ct);
-        return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(ct));
+        var url = new Uri(new Uri(_options.BaseUrl), path);
+        using var content = new StringContent(requestBody, System.Text.Encoding.UTF8, "application/json");
+        using var resp = await client.PostAsync(url, content, ct);
+        return (requestBody, (int)resp.StatusCode, await resp.Content.ReadAsStringAsync(ct));
+    }
+
+    /// <summary>HTTP 2xx 且北森响应信封 code 为 200（北森参数错误时信封 code 为 417 等）。</summary>
+    private static bool IsSuccess(int status, string body)
+    {
+        if (status < 200 || status >= 300) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            return !doc.RootElement.TryGetProperty("code", out var code) || code.ToString() == "200";
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static void EnsureSuccess(string path, int status, string body)
+    {
+        if (!IsSuccess(status, body))
+            throw new InvalidOperationException($"{path} HTTP {status}: {BeisenJson.Truncate(body, 800)}");
+    }
+
+    /// <summary>
+    /// 把员工信息与任职记录按 userID 合并成 [{employeeInfo, recordInfo}]，交给 ParsePage 按现有规则解析。
+    /// 只有两边都查到的员工才保留：缺姓名会建出空名字的账号，缺任职信息无法定位账号与部门。
+    /// </summary>
+    private static string MergeBasicAndService(string basicJson, string serviceJson)
+    {
+        static JsonArray DataArray(string json) => JsonNode.Parse(json)?["data"] as JsonArray ?? new JsonArray();
+        static string? UserIdOf(JsonNode? n) => n is JsonObject o && o.TryGetPropertyValue("userID", out var v) && v != null ? v.ToString() : null;
+
+        var services = new Dictionary<string, JsonNode>(StringComparer.Ordinal);
+        foreach (var s in DataArray(serviceJson))
+        {
+            var id = UserIdOf(s);
+            if (id == null || s == null) continue;
+            // 同一人多条任职记录（未用 option 时可能出现）：优先当前生效的那条
+            var isCurrent = s is JsonObject so && so.TryGetPropertyValue("isCurrentRecord", out var cur) && cur?.ToString() == "true";
+            if (!services.ContainsKey(id) || isCurrent) services[id] = s;
+        }
+
+        var merged = new JsonArray();
+        foreach (var b in DataArray(basicJson))
+        {
+            var id = UserIdOf(b);
+            if (id == null || b == null || !services.TryGetValue(id, out var s)) continue;
+            merged.Add(new JsonObject { ["employeeInfo"] = b.DeepClone(), ["recordInfo"] = s.DeepClone() });
+        }
+        return new JsonObject { ["data"] = merged, ["code"] = "200" }.ToJsonString();
     }
 
     private static (List<BeisenEmployee>, string? scrollId) ParsePage(string json, string[] titleFields)
@@ -205,13 +277,14 @@ public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
                 Surname = BeisenJson.GetStr(basic, "Surname", "surname", "FamilyName"),
                 Email = BeisenJson.GetStr(basic, "email", "Email", "WorkEmail", "workEmail", "companyEmail"),
                 Mobile = BeisenJson.GetStr(basic, "mobilePhone", "MobilePhone", "Mobile", "mobile"),
-                Phone = BeisenJson.GetStr(basic, "officePhone", "OfficePhone", "Phone", "phone"),
+                Phone = BeisenJson.GetStr(basic, "officeTel", "OfficeTel", "officePhone", "OfficePhone", "Phone", "phone"),
                 OrgId = BeisenJson.GetStr(service, "oIdDepartment", "OIdDepartment", "DepartmentId", "departmentId", "OrgId", "orgId"),
                 OrgName = BeisenJson.GetStr(service, "oIdDepartment_TranslateResult", "OIdDepartment_TranslateResult",
-                    "DepartmentName", "departmentName", "OrgName", "orgName"),
-                Title = BeisenJson.GetStr(service, titleFields) ?? BeisenJson.GetStr(basic, titleFields),
-                EmpStatus = BeisenJson.GetInt(service, "empStatus", "EmpStatus", "employeeStatus", "EmployeeStatus", "serviceStatus")
-                          ?? BeisenJson.GetInt(basic, "empStatus", "EmpStatus", "employeeStatus", "EmployeeStatus") ?? 0,
+                    "DepartmentName", "departmentName", "OrgName", "orgName")
+                          ?? TranslateText(service, "OIdDepartmentText"),
+                Title = BeisenJson.GetStr(service, titleFields) ?? BeisenJson.GetStr(basic, titleFields)
+                        ?? TranslateText(service, "OIdJobPostText"),
+                EmpStatus = ParseEmpStatus(service) ?? ParseEmpStatus(basic) ?? 0,
             };
             emp.IsLeaver = emp.EmpStatus is 4 or -1 or 8;
 
@@ -220,6 +293,29 @@ public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
         }
         return (list, scrollId);
     }
+
+    // 北森人员状态枚举名 → 状态码（与 CoreHr EmployeeStatus 枚举顺序一致：1 待入职 2 试用 3 正式 4 调出 5 待调入 6 退休 8 离职 12 非正式）
+    private static readonly Dictionary<string, int> EmpStatusNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["ForEntry"] = 1, ["OnProbation"] = 2, ["InService"] = 3, ["TransferredOut"] = 4, ["TransferredIn"] = 5,
+        ["Retirement"] = 6, ["Reemploy"] = 7, ["Dimission"] = 8, ["Die"] = 9, ["StopReemploy"] = 10,
+        ["ForReemoloy"] = 11, ["Informal"] = 12,
+    };
+
+    /// <summary>人员状态：数字或数字字符串（"3"），也接受枚举名（"InService"）。解析不了返回 null。</summary>
+    private static int? ParseEmpStatus(JsonElement el)
+    {
+        var n = BeisenJson.GetInt(el, "empStatus", "EmpStatus", "employeeStatus", "EmployeeStatus", "serviceStatus");
+        if (n != null) return n;
+        var name = BeisenJson.GetStr(el, "empStatus", "EmpStatus", "employeeStatus", "EmployeeStatus");
+        return name != null && EmpStatusNames.TryGetValue(name.Trim(), out var code) ? code : null;
+    }
+
+    /// <summary>translateProperties 里的翻译文本（如 OIdDepartmentText）；北森 v5 已下线动态翻译，多数情况下为空。</summary>
+    private static string? TranslateText(JsonElement el, string key) =>
+        el.ValueKind == JsonValueKind.Object && el.TryGetProperty("translateProperties", out var tp)
+            ? BeisenJson.GetStr(tp, key)
+            : null;
 
     private static JsonElement? FirstObject(JsonElement el, params string[] keys)
     {
