@@ -12,13 +12,17 @@ internal static class TaskSchedulerHelper
 {
     public const string SyncTask = "BSTOAD-Sync";
     public const string FullTask = "BSTOAD-FullSync";
-    public static readonly string[] AllTasks = { SyncTask, FullTask };
+    public const string EventsTask = "BSTOAD-Events";
+    public static readonly string[] AllTasks = { SyncTask, FullTask, EventsTask };
+
+    // PowerShell 数组字面量 @('BSTOAD-Sync','BSTOAD-FullSync','BSTOAD-Events')
+    private static readonly string AllTasksPs = "@(" + string.Join(",", AllTasks.Select(Ps)) + ")";
 
     public static List<TaskInfo> Query()
     {
         var script = """
             $ErrorActionPreference = 'SilentlyContinue'
-            foreach ($n in @('BSTOAD-Sync','BSTOAD-FullSync')) {
+            foreach ($n in @('BSTOAD-Sync','BSTOAD-FullSync','BSTOAD-Events')) {
               $t = Get-ScheduledTask -TaskName $n
               if (-not $t) { "$n|未安装||||"; continue }
               $i = $t | Get-ScheduledTaskInfo
@@ -39,10 +43,28 @@ internal static class TaskSchedulerHelper
         return list;
     }
 
-    public static string Install(string exePath, int hourlyMinute, TimeSpan fullAt)
+    /// <param name="withEvents">事件订阅已启用：同时注册常驻的事件监听任务并立即启动；否则移除它。</param>
+    public static string Install(string exePath, int hourlyMinute, TimeSpan fullAt, bool withEvents)
     {
         var exe = Ps(exePath);
         var dir = Ps(Path.GetDirectoryName(exePath)!);
+        // 事件监听：开机启动 + 每 5 分钟检查一次（已在运行则忽略，意外退出后 5 分钟内自动拉起）；不限运行时长
+        var events = withEvents
+            ? $$"""
+              $es = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+              $et = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -Once -At ([DateTime]::Now.AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::FromDays(3650))))
+              Register-ScheduledTask -TaskName 'BSTOAD-Events' -Description '北森→AD 事件监听（常驻：北森有变动时实时同步）' -Force `
+                -Action (New-ScheduledTaskAction -Execute {{exe}} -Argument 'listen --apply' -WorkingDirectory {{dir}}) `
+                -Trigger $et -Settings $es -User 'SYSTEM' -RunLevel Highest | Out-Null
+              Stop-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue
+              Start-ScheduledTask -TaskName 'BSTOAD-Events'
+              """
+            : """
+              if (Get-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue) {
+                Stop-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName 'BSTOAD-Events' -Confirm:$false
+              }
+              """;
         var script = $$"""
             $ErrorActionPreference = 'Stop'
             $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
@@ -54,6 +76,7 @@ internal static class TaskSchedulerHelper
               -Action (New-ScheduledTaskAction -Execute {{exe}} -Argument 'sync --apply --full' -WorkingDirectory {{dir}}) `
               -Trigger (New-ScheduledTaskTrigger -Daily -At ([DateTime]::Today.Add([TimeSpan]::FromMinutes({{(int)fullAt.TotalMinutes}})))) `
               -Settings $settings -User 'SYSTEM' -RunLevel Highest | Out-Null
+            {{events}}
             'OK'
             """;
         return RunChecked(script);
@@ -61,15 +84,27 @@ internal static class TaskSchedulerHelper
 
     public static string Enable(bool enable)
     {
+        // 停用时顺带停止正在运行的事件监听（Disable 不会终止已在运行的实例）；启用时把它拉起来
+        var after = enable
+            ? "if(Get-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue){ Start-ScheduledTask -TaskName 'BSTOAD-Events' }"
+            : "Stop-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue";
         var verb = enable ? "Enable-ScheduledTask" : "Disable-ScheduledTask";
-        return RunChecked($"$ErrorActionPreference='Stop'; foreach($n in @('BSTOAD-Sync','BSTOAD-FullSync')){{ if(Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue){{ {verb} -TaskName $n | Out-Null }} }}; 'OK'");
+        return RunChecked($"$ErrorActionPreference='Stop'; foreach($n in {AllTasksPs}){{ if(Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue){{ {verb} -TaskName $n | Out-Null }} }}; {after}; 'OK'");
     }
+
+    /// <summary>重启事件监听（让新配置生效）。任务未安装时报错。</summary>
+    public static string RestartEvents() =>
+        RunChecked("$ErrorActionPreference='Stop'; Get-ScheduledTask -TaskName 'BSTOAD-Events' | Out-Null; Stop-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Start-ScheduledTask -TaskName 'BSTOAD-Events'; 'OK'");
+
+    /// <summary>事件监听任务是否正在运行。</summary>
+    public static bool IsEventsRunning() =>
+        RunPowerShell("$t = Get-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue; if ($t -and $t.State -eq 'Running') { 'RUNNING' }", out _).Contains("RUNNING");
 
     public static string StartNow(string taskName) =>
         RunChecked($"$ErrorActionPreference='Stop'; Start-ScheduledTask -TaskName {Ps(taskName)}; 'OK'");
 
     public static string Uninstall() =>
-        RunChecked("$ErrorActionPreference='Stop'; foreach($n in @('BSTOAD-Sync','BSTOAD-FullSync')){ if(Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue){ Unregister-ScheduledTask -TaskName $n -Confirm:$false } }; 'OK'");
+        RunChecked($"$ErrorActionPreference='Stop'; foreach($n in {AllTasksPs}){{ if(Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue){{ Stop-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $n -Confirm:$false }} }}; 'OK'");
 
     private static string RunChecked(string script)
     {

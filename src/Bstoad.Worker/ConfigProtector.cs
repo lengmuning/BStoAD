@@ -25,6 +25,7 @@ public static class ConfigProtector
         new[] { "Alerts", "DingTalk", "Secret" },
         new[] { "Alerts", "Feishu", "Webhook" },
         new[] { "Alerts", "Feishu", "Secret" },
+        new[] { "EventFeed", "Token" },
     };
 
     public static bool IsProtected(string? value) =>

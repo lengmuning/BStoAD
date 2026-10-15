@@ -32,6 +32,8 @@ public static class SyncEventCategory
     public const string ScenarioDSuspect = "疑似错填工号";
     public const string EmptyEmployeeId = "工号为空";
     public const string PendingHireSkipped = "待入职未建号";
+    public const string EventFeedDown = "事件订阅中断";
+    public const string EventsExpired = "事件已过期";
 }
 
 /// <summary>最近一次全量同步写出的待处理清单（state/pending.json）。</summary>

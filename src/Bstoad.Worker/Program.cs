@@ -4,6 +4,7 @@ using Bstoad.Core.Options;
 using Bstoad.Sync;
 using Bstoad.Worker;
 using Bstoad.Worker.Alerts;
+using Bstoad.Worker.Events;
 using Bstoad.Worker.Gui;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -48,11 +49,17 @@ if (ctx.Command == CommandKind.ProtectConfig)
 if (ctx.Command == CommandKind.TestAlert)
     return await TestAlertCommand.RunAsync(configPath);
 
-// 进程互斥：防止定时任务重叠（如 02:00 全量未跑完，02:07 增量又启动）导致并发写 AD
-using var instanceMutex = new Mutex(initiallyOwned: true, @"Global\BSTOAD-Worker", out var mutexOwned);
-if (!mutexOwned)
+// 进程互斥：防止并发写 AD（如 02:00 全量未跑完，02:07 增量又启动）。
+// 事件监听常驻，只在处理一批事件的几秒内占用同步锁，所以定时任务拿不到锁时先等一等，而不是立即让路；
+// 监听进程本身只占「单实例」锁，保证同一时刻只有一个监听。
+var isListen = ctx.Command == CommandKind.Listen;
+using var instanceMutex = new Mutex(false, isListen ? SyncLock.ListenerMutexName : SyncLock.SyncMutexName);
+if (!SyncLock.AcquireForProcess(instanceMutex, isListen ? TimeSpan.Zero : TimeSpan.FromMinutes(10),
+        "另一个 BSTOAD 同步正在写 AD（定时同步或事件监听），等待它完成（最多 10 分钟）…"))
 {
-    Console.Error.WriteLine("检测到另一个 BSTOAD 实例正在运行，为防止并发写 AD，本次退出（退出码 3）。");
+    Console.Error.WriteLine(isListen
+        ? "事件监听已经在运行，本次退出（退出码 3）。"
+        : "另一个 BSTOAD 同步 10 分钟内仍未结束，为防止并发写 AD，本次退出（退出码 3）。");
     return 3;
 }
 
@@ -78,10 +85,11 @@ Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
     .MinimumLevel.Override("System", LogEventLevel.Warning)
     .WriteTo.Console()
+    // 事件监听常驻，单独一套日志文件（保留 30 天），避免与定时同步争用同一个文件
     .WriteTo.File(
-        Path.Combine(AppContext.BaseDirectory, "logs", "bstoad-.log"),
+        Path.Combine(AppContext.BaseDirectory, "logs", isListen ? "bstoad-listen-.log" : "bstoad-.log"),
         rollingInterval: RollingInterval.Day,
-        retainedFileCountLimit: 14)
+        retainedFileCountLimit: isListen ? 30 : 14)
     .CreateLogger();
 builder.Services.AddSerilog();
 
@@ -99,6 +107,10 @@ builder.Services.AddSingleton<IAlertService, AlertService>();
 builder.Services.PostConfigure<BeisenOptions>(o => o.AppSecret = ConfigProtector.Unprotect(o.AppSecret));
 builder.Services.PostConfigure<ActiveDirectoryOptions>(o => o.ServicePassword = ConfigProtector.Unprotect(o.ServicePassword));
 
+// 事件订阅（v1.2；默认关闭）
+builder.Services.Configure<EventFeedOptions>(builder.Configuration.GetSection(EventFeedOptions.SectionName));
+builder.Services.PostConfigure<EventFeedOptions>(o => o.Token = ConfigProtector.Unprotect(o.Token));
+
 builder.Services.AddSingleton(ctx);
 
 builder.Services.PostConfigure<SyncOptions>(o =>
@@ -113,9 +125,16 @@ builder.Services.PostConfigure<SyncOptions>(o =>
     if (ctx.UsersOnly) o.UsersOnly = true;
     if (ctx.LeaversOnly) o.LeaversOnly = true;
     if (ctx.OnlyEmployeeIds.Length > 0) o.OnlyEmployeeIds = ctx.OnlyEmployeeIds;
+    if (isListen)
+    {
+        // 事件批次只做小窗口增量；离职差集只在每日全量里跑
+        o.FullPull = false;
+        o.ReconcileLeavers = false;
+    }
 });
 
-builder.Services.AddHostedService<SyncWorker>();
+if (isListen) builder.Services.AddHostedService<EventListenerWorker>();
+else builder.Services.AddHostedService<SyncWorker>();
 
 Log.Information("启动: command={Cmd} apply={Apply} full={Full} orgsOnly={OrgsOnly} usersOnly={UsersOnly}",
     ctx.Command, ctx.Apply, ctx.Full, ctx.OrgsOnly, ctx.UsersOnly);

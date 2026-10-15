@@ -1,0 +1,8 @@
+[Unit]
+Description=Run beisen-webhook health check every minute
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+[Install]
+WantedBy=timers.target
