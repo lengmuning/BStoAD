@@ -66,7 +66,7 @@ internal sealed partial class MainForm : Form
         bottom.Controls.Add(_status);
         _saveBtn.Click += (_, _) =>
         {
-            if (SaveConfig()) OfferListenerRestart();
+            if (SaveConfig()) ApplyTaskSettingsAfterSave();
         };
         _revertBtn.Click += (_, _) =>
         {
