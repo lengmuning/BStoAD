@@ -8,16 +8,38 @@ using Microsoft.Extensions.Options;
 
 namespace Bstoad.Sync;
 
+/// <summary>事件监听汇总一批北森事件后提交的同步请求（v1.3）。</summary>
+public sealed class EventBatchRequest
+{
+    /// <summary>按时间窗回查时的窗口起点（本批最早事件时间 − 回看）。</summary>
+    public DateTime WindowStartUtc { get; init; }
+    /// <summary>本批含员工事件；false = 只同步组织架构。</summary>
+    public bool IncludeEmployees { get; init; }
+    /// <summary>本批含组织事件：组织树缓存作废，重新拉取并对齐 OU。</summary>
+    public bool HasOrgEvents { get; init; }
+    /// <summary>本批员工事件涉及的 userId（用于事件↔工号对应日志；ById 模式下据此精确查询）。</summary>
+    public IReadOnlyCollection<string> UserIds { get; init; } = Array.Empty<string>();
+    /// <summary>true = 按 UserIds 精确查询；false = 按时间窗回查。</summary>
+    public bool LookupByIds { get; init; }
+    /// <summary>组织树缓存最长使用时间；Zero = 不缓存，每批都整棵拉取（v1.2 行为）。</summary>
+    public TimeSpan OrgCacheMaxAge { get; init; }
+}
+
+/// <summary>按 userId 精确查询不可用（接口报错或一个都没查到）：事件监听改用时间窗回查这批事件。抛出前未写任何员工数据。</summary>
+public sealed class EventLookupUnavailableException : Exception
+{
+    public EventLookupUnavailableException(string message, Exception? inner = null) : base(message, inner) { }
+}
+
 public interface ISyncOrchestrator
 {
     Task<SyncResult> RunOnceAsync(CancellationToken ct = default);
 
     /// <summary>
-    /// 事件触发的增量同步：组织树照常整体对齐；员工按 windowStartUtc 起的时间窗回查北森
-    /// （与每小时增量走同一个接口、同一套决策树，只是窗口更小）。不跑离职差集。
-    /// includeEmployees=false（本批只有组织事件）时只同步组织架构。
+    /// 事件触发的增量同步：员工按 userId 精确查询或按时间窗回查北森，与定时同步同一套决策树。不跑离职差集。
+    /// 组织树可用缓存（只缓存北森组织树，OU 的 DN 每批按锚点现查，不会因别的进程改名移动而过期）。
     /// </summary>
-    Task<SyncResult> RunEventBatchAsync(DateTime windowStartUtc, bool includeEmployees, CancellationToken ct = default);
+    Task<SyncResult> RunEventBatchAsync(EventBatchRequest request, CancellationToken ct = default);
 }
 
 public sealed class SyncOrchestrator : ISyncOrchestrator
@@ -52,13 +74,34 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
     }
 
     public Task<SyncResult> RunOnceAsync(CancellationToken ct = default)
-        => RunCoreAsync(_sync.OrgsOnly, eventWindowStartUtc: null, ct);
+        => RunCoreAsync(_sync.OrgsOnly, evt: null, ct);
 
-    public Task<SyncResult> RunEventBatchAsync(DateTime windowStartUtc, bool includeEmployees, CancellationToken ct = default)
-        => RunCoreAsync(_sync.OrgsOnly || !includeEmployees, windowStartUtc, ct);
+    public Task<SyncResult> RunEventBatchAsync(EventBatchRequest request, CancellationToken ct = default)
+        => RunCoreAsync(_sync.OrgsOnly || !request.IncludeEmployees, request, ct);
 
-    private async Task<SyncResult> RunCoreAsync(bool orgsOnly, DateTime? eventWindowStartUtc, CancellationToken ct)
+    /// <summary>组织树缓存（只在常驻的事件监听进程里使用）：整份替换、不累积；DN 不缓存。</summary>
+    private sealed class OrgContext
     {
+        /// <summary>同步范围内的组织（已按 RootOrgId 过滤）。</summary>
+        public required IReadOnlyList<BeisenOrg> Orgs { get; init; }
+        /// <summary>北森全部组织 ID（含同步范围外），用于判断员工所在部门是不是缓存之后新建的。</summary>
+        public required HashSet<string> AllOrgIds { get; init; }
+        public required HashSet<string> ScopeOrgIds { get; init; }
+        public required OrgPathBuilder PathBuilder { get; init; }
+        public Dictionary<string, string> OrgIdToDn { get; init; } = new(StringComparer.Ordinal);
+        public DateTime LoadedUtc { get; init; } = DateTime.UtcNow;
+
+        public OrgContext ForNewBatch() => new()
+        {
+            Orgs = Orgs, AllOrgIds = AllOrgIds, ScopeOrgIds = ScopeOrgIds, PathBuilder = PathBuilder, LoadedUtc = LoadedUtc,
+        };
+    }
+
+    private OrgContext? _orgCache;
+
+    private async Task<SyncResult> RunCoreAsync(bool orgsOnly, EventBatchRequest? evt, CancellationToken ct)
+    {
+        var eventWindowStartUtc = evt?.WindowStartUtc;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var result = new SyncResult();
         var mapper = new EmployeeMapper(_adOpt);
@@ -86,44 +129,25 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
                 _adOpt.LdapHost, "AD 绑定失败，本轮所有 AD 操作已跳过：" + ex.Message);
         }
 
-        _logger.LogInformation("[3/6] 拉取全部组织");
-        var orgs = await _orgClient.GetAllOrgsAsync(ct);
-        result.OrgsFetched = orgs.Count;
-
-        if (_sync.DecodeHtmlEntitiesInNames)
-            foreach (var o in orgs) o.Name = System.Net.WebUtility.HtmlDecode(o.Name);
-
-        if (!string.IsNullOrWhiteSpace(_sync.RootOrgId))
+        // 组织：事件批次可用组织树缓存，省掉整棵树的拉取（按 90 天分片，数十次接口调用）与逐个 OU 对齐
+        OrgContext org;
+        var orgFromCache = false;
+        if (evt != null && adReady && !orgsOnly && !evt.HasOrgEvents && evt.OrgCacheMaxAge > TimeSpan.Zero
+            && _orgCache != null && DateTime.UtcNow - _orgCache.LoadedUtc < evt.OrgCacheMaxAge)
         {
-            var filtered = FilterSubtree(orgs, _sync.RootOrgId);
-            _logger.LogInformation("RootOrgId={Root}：取其子树，保留 {Kept}/{Total} 个组织，根的直接子级将挂在 {Base} 下",
-                _sync.RootOrgId, filtered.Count, orgs.Count, _adOpt.BaseUserOu);
-            if (filtered.Count == 0)
-                _logger.LogWarning("RootOrgId={Root} 没有匹配到任何组织，请核对该 OrgId 是否存在", _sync.RootOrgId);
-            orgs = filtered;
+            org = _orgCache.ForNewBatch();
+            orgFromCache = true;
+            _logger.LogInformation("[3/6] 组织树使用缓存（{Min} 分钟前加载，{Count} 个组织）；员工所在部门的 OU 按锚点现查",
+                (int)(DateTime.UtcNow - org.LoadedUtc).TotalMinutes, org.Orgs.Count);
         }
-
-        var pathBuilder = new OrgPathBuilder(orgs, _adOpt.BaseUserOu);
-
-        var orgIdToDn = new Dictionary<string, string>(StringComparer.Ordinal);
-
-        var ensureOu = adReady && _sync.EnsureOuTree && !_sync.UsersOnly;
-        if (ensureOu)
+        else
         {
-            _logger.LogInformation("[3.1] OU 同步（按 OrgId 锚点匹配 → 改名/移动/新建），共 {Count} 个", orgs.Count);
-            EnsureOuRoots();
-            SyncOrgs(orgs, orgIdToDn, result);
-            DetectAbandonedOus(orgs, result);
+            org = await LoadOrgsAsync(adReady, result, ct);
+            if (evt != null && adReady && evt.OrgCacheMaxAge > TimeSpan.Zero) _orgCache = org;
         }
-        else if (adReady && _sync.UsersOnly)
-        {
-            _logger.LogInformation("[3.1] --users-only：跳过建 OU；按锚点扫已有 OU 建立 OrgId→DN 映射");
-            foreach (var ou in _ad.ListOusUnder(_adOpt.BaseUserOu))
-            {
-                if (!string.IsNullOrEmpty(ou.OrgId)) orgIdToDn[ou.OrgId] = ou.Dn;
-            }
-            _logger.LogInformation("  发现已锚定 OU {Count} 个", orgIdToDn.Count);
-        }
+        var orgs = org.Orgs;
+        var pathBuilder = org.PathBuilder;
+        var orgIdToDn = org.OrgIdToDn;
 
         if (orgsOnly)
         {
@@ -139,17 +163,38 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             return result;
         }
 
-        var stop = DateTime.UtcNow.AddSeconds(-_sync.TimeWindowSafetyOffsetSeconds);
-        var windowStart = eventWindowStartUtc ?? stop.AddDays(-_sync.InitialBackfillDays);
-        if (windowStart >= stop) windowStart = stop.AddMinutes(-10);
-        _logger.LogInformation("[4/6] 拉取员工 {Mode}",
-            fullPull ? "全量（FullPullStartDate 起分片）"
-            : eventWindowStartUtc != null ? $"事件时间窗 {windowStart.ToLocalTime():yyyy-MM-dd HH:mm:ss} 起"
-            : $"时间窗最近 {_sync.InitialBackfillDays} 天");
-        var emps = fullPull
-            ? await _empClient.SearchAllAsync(includeDeleted: true, ct)
-            : await _empClient.SearchByTimeWindowAsync(windowStart, stop, includeDeleted: true, ct);
+        IReadOnlyList<BeisenEmployee> emps;
+        if (!fullPull && evt is { LookupByIds: true, UserIds.Count: > 0 })
+        {
+            // 按 userId 精确查询：不依赖北森「修改时间」，事件到达后即可查询
+            _logger.LogInformation("[4/6] 按 userId 精确查询 {Count} 名员工", evt.UserIds.Count);
+            try
+            {
+                emps = await _empClient.GetByUserIdsAsync(evt.UserIds, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                throw new EventLookupUnavailableException("按 userId 查询北森失败：" + ex.Message, ex);
+            }
+            if (emps.Count == 0)
+                throw new EventLookupUnavailableException(
+                    $"按 userId 查询 {evt.UserIds.Count} 人，北森没有返回任何员工（接口路径或参数可能不对，可用 probe-employee 核对）");
+        }
+        else
+        {
+            var stop = DateTime.UtcNow.AddSeconds(-_sync.TimeWindowSafetyOffsetSeconds);
+            var windowStart = eventWindowStartUtc ?? stop.AddDays(-_sync.InitialBackfillDays);
+            if (windowStart >= stop) windowStart = stop.AddMinutes(-10);
+            _logger.LogInformation("[4/6] 拉取员工 {Mode}",
+                fullPull ? "全量（FullPullStartDate 起分片）"
+                : eventWindowStartUtc != null ? $"事件时间窗 {windowStart.ToLocalTime():yyyy-MM-dd HH:mm:ss} 起"
+                : $"时间窗最近 {_sync.InitialBackfillDays} 天");
+            emps = fullPull
+                ? await _empClient.SearchAllAsync(includeDeleted: true, ct)
+                : await _empClient.SearchByTimeWindowAsync(windowStart, stop, includeDeleted: true, ct);
+        }
         result.EmployeesFetched = emps.Count;
+        if (evt is { UserIds.Count: > 0 }) LogEventMatches(evt.UserIds, emps);
 
         // 拉取量哨兵：全量员工数骤降视为数据源异常，本轮拒绝跑差集
         var pullSuspect = false;
@@ -180,6 +225,21 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
                 if (e.Title != null) e.Title = System.Net.WebUtility.HtmlDecode(e.Title);
             }
             ApplyStatusRules(e);
+        }
+
+        // 组织树来自缓存：为本批员工所在部门按锚点现查 OU；遇到缓存之后新建的部门、或 AD 里还没有 OU 的部门，回到完整流程
+        if (orgFromCache)
+        {
+            var reason = ResolveOrgAnchors(emps, org);
+            if (reason != null)
+            {
+                _logger.LogInformation("[3/6] {Reason}：重新拉取组织树并对齐 OU", reason);
+                org = await LoadOrgsAsync(adReady, result, ct);
+                _orgCache = org;
+                orgs = org.Orgs;
+                pathBuilder = org.PathBuilder;
+                orgIdToDn = org.OrgIdToDn;
+            }
         }
 
         // 员工侧 department 文本兜底：北森翻译字段缺失时，用组织树的名称按 OrgId 补
@@ -278,6 +338,103 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             WritePendingReport(result);
 
         return result;
+    }
+
+    /// <summary>拉取全部组织 → 按 RootOrgId 取子树 → 对齐 OU（或 --users-only 时只扫锚点）。</summary>
+    private async Task<OrgContext> LoadOrgsAsync(bool adReady, SyncResult result, CancellationToken ct)
+    {
+        _logger.LogInformation("[3/6] 拉取全部组织");
+        var orgs = await _orgClient.GetAllOrgsAsync(ct);
+        result.OrgsFetched = orgs.Count;
+        var allOrgIds = new HashSet<string>(orgs.Select(o => o.OrgId), StringComparer.Ordinal);
+
+        if (_sync.DecodeHtmlEntitiesInNames)
+            foreach (var o in orgs) o.Name = System.Net.WebUtility.HtmlDecode(o.Name);
+
+        if (!string.IsNullOrWhiteSpace(_sync.RootOrgId))
+        {
+            var filtered = FilterSubtree(orgs, _sync.RootOrgId);
+            _logger.LogInformation("RootOrgId={Root}：取其子树，保留 {Kept}/{Total} 个组织，根的直接子级将挂在 {Base} 下",
+                _sync.RootOrgId, filtered.Count, orgs.Count, _adOpt.BaseUserOu);
+            if (filtered.Count == 0)
+                _logger.LogWarning("RootOrgId={Root} 没有匹配到任何组织，请核对该 OrgId 是否存在", _sync.RootOrgId);
+            orgs = filtered;
+        }
+
+        var ctx = new OrgContext
+        {
+            Orgs = orgs,
+            AllOrgIds = allOrgIds,
+            ScopeOrgIds = new HashSet<string>(orgs.Select(o => o.OrgId), StringComparer.Ordinal),
+            PathBuilder = new OrgPathBuilder(orgs, _adOpt.BaseUserOu),
+        };
+        var orgIdToDn = ctx.OrgIdToDn;
+
+        var ensureOu = adReady && _sync.EnsureOuTree && !_sync.UsersOnly;
+        if (ensureOu)
+        {
+            _logger.LogInformation("[3.1] OU 同步（按 OrgId 锚点匹配 → 改名/移动/新建），共 {Count} 个", orgs.Count);
+            EnsureOuRoots();
+            SyncOrgs(orgs, orgIdToDn, result);
+            DetectAbandonedOus(orgs, result);
+        }
+        else if (adReady && _sync.UsersOnly)
+        {
+            _logger.LogInformation("[3.1] --users-only：跳过建 OU；按锚点扫已有 OU 建立 OrgId→DN 映射");
+            foreach (var ou in _ad.ListOusUnder(_adOpt.BaseUserOu))
+            {
+                if (!string.IsNullOrEmpty(ou.OrgId)) orgIdToDn[ou.OrgId] = ou.Dn;
+            }
+            _logger.LogInformation("  发现已锚定 OU {Count} 个", orgIdToDn.Count);
+        }
+        return ctx;
+    }
+
+    /// <summary>
+    /// 缓存模式：为本批（非离职）员工所在部门按 OU 锚点现查 DN，填入 org.OrgIdToDn。
+    /// 返回需要回到完整流程的原因；null 表示缓存够用。
+    /// </summary>
+    private string? ResolveOrgAnchors(IEnumerable<BeisenEmployee> emps, OrgContext org)
+    {
+        var canCreateOu = _sync.EnsureOuTree && !_sync.UsersOnly;
+        var ids = emps
+            .Where(e => !e.IsLeaver && !string.IsNullOrEmpty(e.OrgId)
+                        && !string.Equals(e.OrgId, _sync.LeaverOrgId, StringComparison.Ordinal))
+            .Select(e => e.OrgId!)
+            .Distinct(StringComparer.Ordinal);
+        foreach (var id in ids)
+        {
+            if (!org.AllOrgIds.Contains(id)) return $"部门 {id} 不在组织树缓存中（可能是新建的部门）";
+            if (!org.ScopeOrgIds.Contains(id)) continue; // 同步范围外：与完整流程一样按名字推算
+            var ou = _ad.FindOuByOrgIdMarker(id);
+            if (ou == null)
+            {
+                if (canCreateOu) return $"部门 {id} 在 AD 中还没有对应的 OU";
+                continue;
+            }
+            org.OrgIdToDn[id] = ou.Dn;
+        }
+        return null;
+    }
+
+    /// <summary>把事件里的 userId 对应到北森返回的工号 / 姓名，便于追查「这条事件是谁」。</summary>
+    private void LogEventMatches(IReadOnlyCollection<string> userIds, IReadOnlyList<BeisenEmployee> emps)
+    {
+        var byUserId = emps
+            .Where(e => !string.IsNullOrEmpty(e.UserId))
+            .GroupBy(e => e.UserId, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+        const int maxLines = 50;
+        foreach (var id in userIds.Take(maxLines))
+        {
+            if (byUserId.TryGetValue(id, out var e))
+                _logger.LogInformation("  [事件] userId={UserId} → 工号 {EmpId} {Name}（{Org}）",
+                    id, e.EmployeeId, e.Name, e.OrgName ?? e.OrgId ?? "");
+            else
+                _logger.LogWarning("  [事件] userId={UserId} 在北森返回结果中没有找到（时间窗内无变动，或不在拉取范围内），每日全量会兜底", id);
+        }
+        if (userIds.Count > maxLines)
+            _logger.LogInformation("  [事件] 其余 {N} 个 userId 不逐条列出", userIds.Count - maxLines);
     }
 
     /// <summary>empStatus 业务口径：4 调出 / 6 退休是否按离职处理（默认与 v1.0 一致）。</summary>
@@ -709,9 +866,14 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             _logger.LogInformation("  [场景{Sc}/Update] {Dn}", scenarioHint, existing.Dn);
         }
 
-        if (!_sync.DryRun)
-            _ad.UpdateUserAttributes(newDn, attrs);
-        result.UsersUpdated++;
+        // 只写有差异的属性；「更新」只统计真正改动过的账号（v1.3 起），可用于评估事件订阅是否漏掉变更
+        var changed = _ad.UpdateUserAttributes(newDn, attrs, dryRun: _sync.DryRun);
+        if (changed.Count > 0)
+        {
+            result.UsersUpdated++;
+            _logger.LogInformation("  [属性] {Dn} 变更: {Attrs}{Dry}", newDn, string.Join(",", changed),
+                _sync.DryRun ? "（干跑，未写入）" : "");
+        }
 
         if (emp.IsLeaver && !existing.IsDisabled)
         {

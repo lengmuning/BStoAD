@@ -22,7 +22,11 @@ public interface IAdProvisioner
     AdUserSnapshot? GetUser(string userDn);
 
     string CreateUser(string parentOuDn, AdUserAttributes attrs, string initialPassword);
-    void UpdateUserAttributes(string userDn, AdUserAttributes attrs);
+    /// <summary>
+    /// 只写与 AD 当前值不同的属性（北森侧为空的字段不清空 AD），缺纳管标记时一并补上，一次读 + 至多一次写。
+    /// 返回有差异的属性名（dryRun 时只比较不写入）；为空表示账号已是最新。
+    /// </summary>
+    IReadOnlyList<string> UpdateUserAttributes(string userDn, AdUserAttributes attrs, bool dryRun = false);
     string MoveUser(string userDn, string newParentOuDn, string? rdnUniquifier = null);
 
     void DisableUser(string userDn);
@@ -268,28 +272,50 @@ public sealed class AdProvisioner : IAdProvisioner
         return userDn;
     }
 
-    public void UpdateUserAttributes(string userDn, AdUserAttributes attrs)
+    public IReadOnlyList<string> UpdateUserAttributes(string userDn, AdUserAttributes attrs, bool dryRun = false)
     {
-        using var conn = _connFactory.Create();
-        var mods = new List<DirectoryAttributeModification>();
-        AddReplace(mods, "displayName", attrs.DisplayName);
-        AddReplace(mods, "userPrincipalName", attrs.UserPrincipalName);
-        AddReplace(mods, "givenName", attrs.GivenName);
-        AddReplace(mods, "sn", attrs.Surname);
-        AddReplace(mods, "mail", attrs.Mail);
-        AddReplace(mods, "telephoneNumber", attrs.TelephoneNumber);
-        AddReplace(mods, "mobile", attrs.Mobile);
-        AddReplace(mods, "department", attrs.Department);
-        AddReplace(mods, "title", attrs.Title);
-        AddReplace(mods, "employeeID", attrs.EmployeeId);
-
-        if (mods.Count > 0)
+        var markerAttr = _options.ManagedMarkerAttribute;
+        var desired = new (string Name, string? Value)[]
         {
-            conn.SendRequest(new ModifyRequest(userDn, mods.ToArray()));
-            _logger.LogInformation("更新属性: {Dn} ({Count} 项)", userDn, mods.Count);
+            ("displayName", attrs.DisplayName),
+            ("userPrincipalName", attrs.UserPrincipalName),
+            ("givenName", attrs.GivenName),
+            ("sn", attrs.Surname),
+            ("mail", attrs.Mail),
+            ("telephoneNumber", attrs.TelephoneNumber),
+            ("mobile", attrs.Mobile),
+            ("department", attrs.Department),
+            ("title", attrs.Title),
+            ("employeeID", attrs.EmployeeId),
+            (markerAttr, _options.ManagedMarkerValue),
+        };
+
+        using var conn = _connFactory.Create();
+        var names = desired.Select(d => d.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var resp = (SearchResponse)conn.SendRequest(new SearchRequest(userDn, "(objectClass=*)", SearchScope.Base, names));
+        if (resp.Entries.Count == 0)
+            throw new InvalidOperationException("账号不存在: " + userDn);
+        var entry = resp.Entries[0];
+
+        var mods = new List<DirectoryAttributeModification>();
+        var changed = new List<string>();
+        foreach (var (name, value) in desired)
+        {
+            if (string.IsNullOrEmpty(value)) continue; // 北森侧为空：保守起见不清空 AD（与 v1.x 一致）
+            var current = entry.Attributes.Contains(name) ? Convert.ToString(entry.Attributes[name][0]) : null;
+            if (string.Equals(current, value, StringComparison.Ordinal)) continue;
+            AddReplace(mods, name, value);
+            changed.Add(name);
         }
 
-        EnsureManagedMarkerInternal(conn, userDn);
+        if (mods.Count > 0 && !dryRun)
+        {
+            conn.SendRequest(new ModifyRequest(userDn, mods.ToArray()));
+            _logger.LogInformation("更新属性: {Dn} → {Attrs}", userDn, string.Join(",", changed));
+            if (changed.Contains(markerAttr))
+                _logger.LogInformation("打纳管标记 {Attr}={Value} → {Dn}", markerAttr, _options.ManagedMarkerValue, userDn);
+        }
+        return changed;
     }
 
     public string MoveUser(string userDn, string newParentOuDn, string? rdnUniquifier = null)

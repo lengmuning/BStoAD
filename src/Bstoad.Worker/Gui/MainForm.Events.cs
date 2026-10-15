@@ -9,6 +9,8 @@ internal sealed partial class MainForm
     private CheckBox _evEnabled = null!, _evHourly = null!;
     private TextBox _evUrl = null!, _evToken = null!;
     private NumericUpDown _evPoll = null!, _evSettle = null!, _evAlertAfter = null!;
+    private ComboBox _evLookup = null!;
+    private static readonly string[] LookupModes = { "TimeWindow", "ById" };
 
     // =====================================================================
     // 事件订阅
@@ -34,10 +36,15 @@ internal sealed partial class MainForm
             RunBackground(btns[0], res, () => TestEventFeed(url, token));
         };
 
+        f.Section("员工数据怎么查");
+        _evLookup = f.Combo("查询方式", 360, "按时间窗回查（默认，稳定）", "按 userId 精确查询（更快，需先核对接口）");
+        f.Hint("北森事件只说明「谁变了」。按 userId 精确查询约 15～30 秒生效；启用前先在命令行运行 " +
+               "Bstoad.Worker.exe probe-employee --user-id <某个 userId>，确认北森接口可用。查询失败时这批事件自动改用时间窗回查。");
+
         f.Section("高级");
         _evPoll = f.Number("轮询间隔", 2, 600, 0, "秒");
         _evSettle = f.Number("合并等待", 30, 3600, 0, "秒");
-        f.Hint("收到事件后等这么久没有新事件再同步，把 HR 的一组连续操作合并成一次。需大于 75 秒（北森数据写入后要等一会儿才查得到）。");
+        f.Hint("按时间窗回查时：收到事件后等这么久没有新事件再同步，把 HR 的一组连续操作合并成一次。需大于 75 秒（北森数据写入后要等一会儿才按修改时间查得到）。按 userId 查询不受此限制。");
         _evAlertAfter = f.Number("连不上事件服务", 1, 1440, 0, "分钟后告警（走「告警」页的渠道）");
 
         f.Section("定时同步");
@@ -88,6 +95,8 @@ internal sealed partial class MainForm
         _evSettle.Value = Math.Clamp(d.GetInt(def.SettleSeconds, "EventFeed", "SettleSeconds"), 30, 3600);
         _evAlertAfter.Value = Math.Clamp(d.GetInt(def.AlertAfterMinutes, "EventFeed", "AlertAfterMinutes"), 1, 1440);
         _evHourly.Checked = d.GetBool(new SyncOptions().HourlyIncrementalEnabled, "Sync", "HourlyIncrementalEnabled");
+        var mode = d.GetString(def.LookupMode, "EventFeed", "LookupMode");
+        _evLookup.SelectedIndex = Math.Max(0, Array.FindIndex(LookupModes, m => string.Equals(m, mode, StringComparison.OrdinalIgnoreCase)));
     }
 
     private void CollectEvents()
@@ -99,6 +108,7 @@ internal sealed partial class MainForm
         d.SetInt((int)_evSettle.Value, "EventFeed", "SettleSeconds");
         d.SetInt((int)_evAlertAfter.Value, "EventFeed", "AlertAfterMinutes");
         d.SetBool(_evHourly.Checked, "Sync", "HourlyIncrementalEnabled");
+        d.SetString(LookupModes[Math.Max(0, _evLookup.SelectedIndex)], "EventFeed", "LookupMode");
         if (d.Get("EventFeed", "Token") == null) d.SetString("", "EventFeed", "Token");
     }
 

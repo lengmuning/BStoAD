@@ -49,6 +49,10 @@ if (ctx.Command == CommandKind.ProtectConfig)
 if (ctx.Command == CommandKind.TestAlert)
     return await TestAlertCommand.RunAsync(configPath);
 
+// probe-employee 只读北森、不碰 AD，不需要同步锁
+if (ctx.Command == CommandKind.ProbeEmployee)
+    return await ProbeEmployeeCommand.RunAsync(configPath, ctx.ProbeUserIds);
+
 // 进程互斥：防止并发写 AD（如 02:00 全量未跑完，02:07 增量又启动）。
 // 事件监听常驻，只在处理一批事件的几秒内占用同步锁，所以定时任务拿不到锁时先等一等，而不是立即让路；
 // 监听进程本身只占「单实例」锁，保证同一时刻只有一个监听。

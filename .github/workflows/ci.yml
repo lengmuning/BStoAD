@@ -1,9 +1,9 @@
 name: CI
 
-# 推送到 main 或提交 PR 时编译检查（与 Release 相同的发布参数），确保打 tag 前能编译通过
+# 推送任何分支或提交 PR 时编译检查（与 Release 相同的发布参数）：分支上编译通过再合并进 main、打 tag
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
 
 jobs:

@@ -29,6 +29,14 @@ public sealed class BeisenOptions
     public Dictionary<string, string> OrgExtraParams { get; set; } = new();
     public Dictionary<string, string> EmployeeExtraParams { get; set; } = new();
 
+    // 按 userId 精确查询员工（v1.3；事件订阅「按 userId 精确查询」时使用）。
+    // 该接口未在本工具适配过的租户上验证：路径、ID 参数名、ID 类型都做成配置，先用 probe-employee 命令核对再启用。
+    public string EmployeeByIdsPath { get; set; } = "/TenantBaseExternal/api/v5/Employee/GetByIds";
+    public string EmployeeByIdsParam { get; set; } = "ids";
+    // true = ID 按数字发送 [645506318]；false = 按字符串 ["645506318"]
+    public bool EmployeeByIdsAsNumbers { get; set; } = true;
+    public Dictionary<string, string> EmployeeByIdsExtraParams { get; set; } = new();
+
     public int TokenRefreshSkewSeconds { get; set; } = 300;
 
     // 是否在日志输出北森原始响应样本（含身份证号/住址等 PII）。

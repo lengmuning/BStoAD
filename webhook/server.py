@@ -13,6 +13,15 @@ FEED_PORT = int(os.environ.get('BEISEN_FEED_PORT', '8601'))
 FEED_TOKEN = os.environ.get('BEISEN_FEED_TOKEN', '')
 RETENTION_DAYS = int(os.environ.get('BEISEN_RETENTION_DAYS', '30'))
 
+# Long-poll: /v1/events?wait=N holds the request until a new event arrives (or N seconds pass).
+# _event_gen is bumped on every new row; readers capture it before querying, so an event that lands
+# between the query and the wait is never missed. At most MAX_WAITERS requests wait at once.
+_new_event = threading.Condition()
+_event_gen = [0]
+MAX_WAITERS = 4
+_waiters = threading.BoundedSemaphore(MAX_WAITERS)
+LONG_POLL_MAX_SECONDS = 30
+
 class Server(ThreadingHTTPServer):
     # HTTPServer.server_bind() calls socket.getfqdn() between bind and listen. With the public DNS on this
     # host that reverse lookup of the intranet IP times out (~11 s per port), refusing connections meanwhile.
@@ -88,6 +97,10 @@ class Handler(BaseHTTPRequestHandler):
             category = str(event.get('biz_typeCode', '')).strip()
             with connect() as c:
                 cur = c.execute('INSERT OR IGNORE INTO events(tenant_id,biz_id,category,received_at,payload) VALUES(?,?,?,?,?)', (tenant,event_id,category,time.time(),plaintext.decode('utf-8')))
+            if cur.rowcount:
+                with _new_event:
+                    _event_gen[0] += 1
+                    _new_event.notify_all()
             # Category and event id only; payload may contain personal data.
             print(f"accepted {category or '<none>'} biz_id={event_id[:64]} {'new' if cur.rowcount else 'duplicate'}", flush=True)
             self.reply(200, b'ok')
@@ -151,21 +164,39 @@ class FeedHandler(BaseHTTPRequestHandler):
             return self.reply(401)
         try:
             q = parse_qs(parts.query, max_num_fields=5)
-            with closing(connect()) as c:
-                mx, mn, n, latest = c.execute('SELECT COALESCE(MAX(rowid),0), COALESCE(MIN(rowid),0), COUNT(*), MAX(received_at) FROM events').fetchone()
-                body = {'maxSeq': mx, 'minSeq': mn, 'count': n, 'retentionDays': RETENTION_DAYS,
-                        'latestReceivedAtMs': int(latest * 1000) if latest else None}
-                if parts.path == '/v1/events':
-                    after = int(q.get('after', ['0'])[0])
-                    limit = max(0, min(int(q.get('limit', ['200'])[0]), 1000))
-                    rows = c.execute('SELECT rowid, category, received_at, payload FROM events WHERE rowid > ? ORDER BY rowid LIMIT ?', (after, limit)).fetchall()
-                    body['events'] = [feed_event(*r) for r in rows]
+            if parts.path == '/v1/status':
+                body = feed_query(None, 0)
+            else:
+                after = int(q.get('after', ['0'])[0])
+                limit = max(0, min(int(q.get('limit', ['200'])[0]), 1000))
+                wait = max(0, min(int(q.get('wait', ['0'])[0]), LONG_POLL_MAX_SECONDS))
+                with _new_event:
+                    gen = _event_gen[0]
+                body = feed_query(after, limit)
+                if not body['events'] and wait and _waiters.acquire(blocking=False):
+                    try:
+                        with _new_event:
+                            _new_event.wait_for(lambda: _event_gen[0] != gen, timeout=wait)
+                    finally:
+                        _waiters.release()
+                    body = feed_query(after, limit)
             self.reply(200, json.dumps(body, ensure_ascii=False).encode('utf-8'), 'application/json; charset=utf-8')
         except (ValueError, TypeError):
             self.reply(400)
         except Exception as e:
             print(f'feed request failed: {type(e).__name__}', flush=True)
             self.reply(503)
+
+def feed_query(after, limit):
+    """Stats, plus events after `after` when it is not None. Opens and closes its own connection."""
+    with closing(connect()) as c:
+        mx, mn, n, latest = c.execute('SELECT COALESCE(MAX(rowid),0), COALESCE(MIN(rowid),0), COUNT(*), MAX(received_at) FROM events').fetchone()
+        body = {'maxSeq': mx, 'minSeq': mn, 'count': n, 'retentionDays': RETENTION_DAYS,
+                'latestReceivedAtMs': int(latest * 1000) if latest else None}
+        if after is not None:
+            rows = c.execute('SELECT rowid, category, received_at, payload FROM events WHERE rowid > ? ORDER BY rowid LIMIT ?', (after, limit)).fetchall()
+            body['events'] = [feed_event(*r) for r in rows]
+    return body
 
 # ---------------- Retention ----------------
 

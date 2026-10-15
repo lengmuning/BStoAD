@@ -34,6 +34,7 @@ public static class SyncEventCategory
     public const string PendingHireSkipped = "待入职未建号";
     public const string EventFeedDown = "事件订阅中断";
     public const string EventsExpired = "事件已过期";
+    public const string ListenerMemory = "事件监听内存超限";
 }
 
 /// <summary>最近一次全量同步写出的待处理清单（state/pending.json）。</summary>

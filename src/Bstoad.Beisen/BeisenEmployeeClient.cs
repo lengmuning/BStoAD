@@ -16,6 +16,15 @@ public interface IBeisenEmployeeClient
     /// <summary>指定时间窗（内部自动按 ≤90 天分片）。</summary>
     Task<IReadOnlyList<BeisenEmployee>> SearchByTimeWindowAsync(
         DateTime startUtc, DateTime stopUtc, bool includeDeleted, CancellationToken ct = default);
+
+    /// <summary>按 userId 精确查询（接口与参数见 BeisenOptions.EmployeeByIds*）。HTTP 失败时抛异常。</summary>
+    Task<IReadOnlyList<BeisenEmployee>> GetByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default);
+
+    /// <summary>probe-employee 用：发与 GetByUserIdsAsync 相同的请求，返回 HTTP 状态与原始响应，不解析、不抛 HTTP 错误。</summary>
+    Task<(int Status, string Body)> ProbeByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default);
+
+    /// <summary>按与时间窗接口相同的规则解析响应（供 probe-employee 展示解析结果）。</summary>
+    IReadOnlyList<BeisenEmployee> ParseEmployees(string json);
 }
 
 public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
@@ -121,6 +130,49 @@ public sealed class BeisenEmployeeClient : IBeisenEmployeeClient
         _logger.LogInformation("拉取员工完成，共 {Count} 条（窗口 {Start:yyyy-MM-dd} ~ {Stop:yyyy-MM-dd}）",
             byKey.Count, startUtc, stopUtc);
         return byKey.Values.ToList();
+    }
+
+    public async Task<IReadOnlyList<BeisenEmployee>> GetByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default)
+    {
+        var byKey = new Dictionary<string, BeisenEmployee>(StringComparer.Ordinal);
+        foreach (var chunk in userIds.Distinct(StringComparer.Ordinal).Chunk(Math.Clamp(_options.PageCapacity, 1, 300)))
+        {
+            var (status, json) = await PostByIdsAsync(chunk, ct);
+            if (status < 200 || status >= 300)
+                throw new InvalidOperationException($"{_options.EmployeeByIdsPath} {status}: {BeisenJson.Truncate(json, 800)}");
+            var (page, _) = ParsePage(json, _options.TitleFields);
+            foreach (var e in page)
+                byKey[!string.IsNullOrEmpty(e.UserId) ? e.UserId : e.EmployeeId] = e;
+        }
+        return byKey.Values.ToList();
+    }
+
+    public Task<(int Status, string Body)> ProbeByUserIdsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct = default)
+        => PostByIdsAsync(userIds.ToArray(), ct);
+
+    public IReadOnlyList<BeisenEmployee> ParseEmployees(string json) => ParsePage(json, _options.TitleFields).Item1;
+
+    private async Task<(int Status, string Body)> PostByIdsAsync(IReadOnlyCollection<string> ids, CancellationToken ct)
+    {
+        var token = await _tokenProvider.GetAccessTokenAsync(ct);
+        var client = _httpClientFactory.CreateClient(nameof(BeisenEmployeeClient));
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        object idList = _options.EmployeeByIdsAsNumbers
+            ? ids.Select(id => long.TryParse(id, out var n) ? (object)n : id).ToArray()
+            : ids.ToArray();
+        var body = new Dictionary<string, object?>
+        {
+            [_options.EmployeeByIdsParam] = idList,
+            ["IsWithDeleted"] = true,
+            ["EnableTranslate"] = true,
+        };
+        foreach (var kv in _options.EmployeeByIdsExtraParams)
+            body[kv.Key] = BeisenJson.ParseConfigValue(kv.Value);
+
+        var url = new Uri(new Uri(_options.BaseUrl), _options.EmployeeByIdsPath);
+        using var resp = await client.PostAsJsonAsync(url, body, ct);
+        return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(ct));
     }
 
     private static (List<BeisenEmployee>, string? scrollId) ParsePage(string json, string[] titleFields)

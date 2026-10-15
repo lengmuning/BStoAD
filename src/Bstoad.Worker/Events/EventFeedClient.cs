@@ -57,8 +57,9 @@ public sealed class EventFeedClient : IDisposable
 
     public Task<FeedPage> GetStatusAsync(CancellationToken ct = default) => GetAsync("v1/status", ct);
 
-    public Task<FeedPage> GetEventsAsync(long after, int limit, CancellationToken ct = default) =>
-        GetAsync($"v1/events?after={after}&limit={limit}", ct);
+    /// <param name="waitSeconds">长轮询：没有新事件时让服务端最多挂起这么久（旧版服务端忽略此参数，立即返回）。</param>
+    public Task<FeedPage> GetEventsAsync(long after, int limit, int waitSeconds = 0, CancellationToken ct = default) =>
+        GetAsync($"v1/events?after={after}&limit={limit}" + (waitSeconds > 0 ? $"&wait={waitSeconds}" : ""), ct);
 
     private async Task<FeedPage> GetAsync(string relative, CancellationToken ct)
     {

@@ -1,6 +1,6 @@
 namespace Bstoad.Worker;
 
-public enum CommandKind { Sync, MatchAd, MigrateMarker, InitConfig, ProtectConfig, Gui, TestAlert, Listen }
+public enum CommandKind { Sync, MatchAd, MigrateMarker, InitConfig, ProtectConfig, Gui, TestAlert, Listen, ProbeEmployee }
 
 public sealed class CommandContext
 {
@@ -11,6 +11,7 @@ public sealed class CommandContext
     public bool UsersOnly { get; init; }
     public bool LeaversOnly { get; init; }
     public string[] OnlyEmployeeIds { get; init; } = Array.Empty<string>();
+    public string[] ProbeUserIds { get; init; } = Array.Empty<string>();
 
     public static CommandContext Parse(string[] args)
     {
@@ -21,6 +22,7 @@ public sealed class CommandContext
         var usersOnly = false;
         var leaversOnly = false;
         var only = new List<string>();
+        var probeIds = new List<string>();
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -35,6 +37,12 @@ public sealed class CommandContext
                 case "gui": cmd = CommandKind.Gui; break;
                 case "test-alert": cmd = CommandKind.TestAlert; break;
                 case "listen": cmd = CommandKind.Listen; break;
+                case "probe-employee": cmd = CommandKind.ProbeEmployee; break;
+                case "--user-id":
+                    if (i + 1 < args.Length)
+                        probeIds.AddRange(args[++i].Split(',',
+                            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                    break;
                 case "--apply": apply = true; break;
                 case "--full": full = true; break;
                 case "--orgs-only": orgsOnly = true; break;
@@ -68,6 +76,7 @@ public sealed class CommandContext
             UsersOnly = usersOnly,
             LeaversOnly = leaversOnly,
             OnlyEmployeeIds = only.ToArray(),
+            ProbeUserIds = probeIds.ToArray(),
         };
     }
 
@@ -93,6 +102,10 @@ BSTOAD · 北森 → AD 同步
       需先在配置 EventFeed 段（图形界面「事件订阅」页）启用并填写地址和令牌
       由计划任务 BSTOAD-Events 开机自启；与定时同步共用同一把锁，不会并发写 AD
       不加 --apply 为干跑（只打印决策、不保存处理进度）；--only 用于试点
+
+  bstoad probe-employee --user-id userId[,userId...]
+      核对「按 userId 精确查询」用的北森接口（只读北森，不碰 AD）
+      打印响应结构（值已隐去，可转发）和解析出的工号姓名（仅本机查看）
 
   bstoad match-ad [--apply]
       上线前预匹配：P1 SAM=工号 / P2 邮箱 → 回填 employeeID 到老账号

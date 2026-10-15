@@ -36,4 +36,29 @@ public sealed class EventFeedOptions
 
     /// <summary>连续这么多分钟连不上事件服务时告警（走「告警」页的渠道）。</summary>
     public int AlertAfterMinutes { get; set; } = 10;
+
+    // ---- v1.3 轻量化 ----
+
+    /// <summary>
+    /// 员工数据怎么查：TimeWindow = 按时间窗回查（默认，稳定）；ById = 按事件里的 userId 精确查询（更快，
+    /// 需先用 probe-employee 核对北森接口）。ById 查询失败时，这批事件自动改用时间窗回查。
+    /// </summary>
+    public string LookupMode { get; set; } = "TimeWindow";
+
+    /// <summary>按 userId 查询时的合并等待（不受北森「修改时间」写入延迟影响，可以很短）。</summary>
+    public int ByIdSettleSeconds { get; set; } = 10;
+
+    /// <summary>组织树缓存时长（分钟）。只缓存北森组织树，OU 每批按锚点现查；0 = 每批都整棵拉取（v1.2 行为）。</summary>
+    public int OrgCacheMinutes { get; set; } = 120;
+
+    /// <summary>长轮询：没有新事件时请求最多挂起这么久（事件服务支持时生效，最大 30）；0 = 普通轮询。</summary>
+    public int LongPollSeconds { get; set; } = 25;
+
+    /// <summary>内存自检：监听进程内存超过此值（MB）时告警并退出，由计划任务在 5 分钟内重新拉起。</summary>
+    public int MaxMemoryMB { get; set; } = 512;
+
+    /// <summary>一批最多记录多少个不同的 userId；超出后这批改用时间窗回查（内存上限与员工人数同级）。</summary>
+    public int MaxPendingUserIds { get; set; } = 2000;
+
+    public bool UseLookupById => string.Equals(LookupMode, "ById", StringComparison.OrdinalIgnoreCase);
 }
