@@ -8,6 +8,10 @@ public sealed class SyncOptions
     public bool RunOnceAndExit { get; set; } = true;
 
     public int IncrementalIntervalMinutes { get; set; } = 60;
+
+    // 计划任务 BSTOAD-Sync（每小时增量）是否运行。v1.2.1 起可暂停，改为只靠事件订阅 + 每日全量；
+    // 由图形界面在保存配置 / 安装任务时应用到任务计划程序（停用任务，不删除），同步程序本身不读取此项。
+    public bool HourlyIncrementalEnabled { get; set; } = true;
     public string FullSyncCron { get; set; } = "0 0 2 * * ?";
 
     public int TimeWindowSafetyOffsetSeconds { get; set; } = 60;

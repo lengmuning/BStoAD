@@ -6,7 +6,7 @@ namespace Bstoad.Worker.Gui;
 internal sealed partial class MainForm
 {
     // ---- 事件订阅 ----
-    private CheckBox _evEnabled = null!;
+    private CheckBox _evEnabled = null!, _evHourly = null!;
     private TextBox _evUrl = null!, _evToken = null!;
     private NumericUpDown _evPoll = null!, _evSettle = null!, _evAlertAfter = null!;
 
@@ -39,6 +39,13 @@ internal sealed partial class MainForm
         _evSettle = f.Number("合并等待", 30, 3600, 0, "秒");
         f.Hint("收到事件后等这么久没有新事件再同步，把 HR 的一组连续操作合并成一次。需大于 75 秒（北森数据写入后要等一会儿才查得到）。");
         _evAlertAfter = f.Number("连不上事件服务", 1, 1440, 0, "分钟后告警（走「告警」页的渠道）");
+
+        f.Section("定时同步");
+        _evHourly = f.Check("保留每小时增量同步（计划任务 BSTOAD-Sync）");
+        f.Hint("事件订阅稳定前建议保留。取消勾选并保存后，每小时增量任务被暂停（不删除，重新勾选即恢复），" +
+               "北森变更只靠事件订阅同步，每日全量同步照常运行。");
+        f.Hint("暂停前请确认北森已推送你关心的全部事件类型（入职、调动、离职、组织变更等）——没有推送的类型要等每日全量才会同步。" +
+               "观察方法：每日全量同步若仍有新建 / 移动 / 禁用，就是事件没有覆盖到的变更（可在「告警」页开启每日汇总）。", warn: true);
 
         f.Section("让它运行起来");
         f.Hint("保存配置后，到「计划任务」页点「安装 / 更新任务」：会注册开机自启的 BSTOAD-Events 任务并立即启动。" +
@@ -80,6 +87,7 @@ internal sealed partial class MainForm
         _evPoll.Value = Math.Clamp(d.GetInt(def.PollIntervalSeconds, "EventFeed", "PollIntervalSeconds"), 2, 600);
         _evSettle.Value = Math.Clamp(d.GetInt(def.SettleSeconds, "EventFeed", "SettleSeconds"), 30, 3600);
         _evAlertAfter.Value = Math.Clamp(d.GetInt(def.AlertAfterMinutes, "EventFeed", "AlertAfterMinutes"), 1, 1440);
+        _evHourly.Checked = d.GetBool(new SyncOptions().HourlyIncrementalEnabled, "Sync", "HourlyIncrementalEnabled");
     }
 
     private void CollectEvents()
@@ -90,11 +98,14 @@ internal sealed partial class MainForm
         d.SetInt((int)_evPoll.Value, "EventFeed", "PollIntervalSeconds");
         d.SetInt((int)_evSettle.Value, "EventFeed", "SettleSeconds");
         d.SetInt((int)_evAlertAfter.Value, "EventFeed", "AlertAfterMinutes");
+        d.SetBool(_evHourly.Checked, "Sync", "HourlyIncrementalEnabled");
         if (d.Get("EventFeed", "Token") == null) d.SetString("", "EventFeed", "Token");
     }
 
     private void ValidateEvents(List<string> p)
     {
+        if (!_evHourly.Checked && !_evEnabled.Checked)
+            p.Add("每小时增量已暂停，且未启用事件订阅：北森的变更要等每日全量同步才会写入 AD");
         if (!_evEnabled.Checked) return;
         if (!Uri.TryCreate(_evUrl.Text.Trim(), UriKind.Absolute, out var u) || (u.Scheme != "http" && u.Scheme != "https"))
             p.Add("已启用事件订阅，但事件服务地址不是有效的 http(s) 地址");
@@ -104,13 +115,20 @@ internal sealed partial class MainForm
             p.Add("合并等待小于 75 秒：北森数据可能还查不到，程序会自动按 75 秒执行");
     }
 
-    /// <summary>保存配置后：事件监听正在运行时提示重启，让新配置生效。</summary>
-    private void OfferListenerRestart()
+    /// <summary>
+    /// 保存配置后应用到计划任务：按「保留每小时增量同步」暂停 / 恢复 BSTOAD-Sync；
+    /// 事件监听正在运行时提示重启，让新配置生效。
+    /// </summary>
+    private void ApplyTaskSettingsAfterSave()
     {
-        RunBackgroundThen(null, TaskSchedulerHelper.IsEventsRunning, running =>
+        var hourly = _evHourly.Checked;
+        RunBackgroundThen(null, () => (Hourly: TaskSchedulerHelper.SetHourly(hourly), Running: TaskSchedulerHelper.IsEventsRunning()), r =>
         {
-            if (!running) return;
-            if (Confirm("事件监听正在运行，新配置需要重启它才能生效。现在重启？"))
+            if (r.Hourly == "CHANGED")
+                ShowInfo(hourly
+                    ? "已恢复每小时增量同步（BSTOAD-Sync 已启用）。"
+                    : "已暂停每小时增量同步（BSTOAD-Sync 已停用，未删除）。北森变更现在只靠事件订阅 + 每日全量同步。");
+            if (r.Running && Confirm("事件监听正在运行，新配置需要重启它才能生效。现在重启？"))
                 RunBackgroundThen(null, TaskSchedulerHelper.RestartEvents, _ => ShowInfo("事件监听已重启。"));
         });
     }

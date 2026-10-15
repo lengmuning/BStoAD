@@ -618,7 +618,8 @@ internal sealed partial class MainForm
         _tFullTime = fb.Custom("全量同步",
             new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 100 },
             "每天这个时间运行，含离职对账，建议放在夜间");
-        fb.Hint("「事件订阅」页启用后，安装时会一并注册常驻的事件监听任务 BSTOAD-Events（开机自启、意外退出 5 分钟内自动拉起）。");
+        fb.Hint("「事件订阅」页启用后，安装时会一并注册常驻的事件监听任务 BSTOAD-Events（开机自启、意外退出 5 分钟内自动拉起）。" +
+                "每小时增量可在「事件订阅」页暂停。");
         var (btns, res) = fb.Actions("刷新状态", "安装 / 更新任务", "启用", "停用", "立即运行增量", "立即运行全量", "卸载任务", "重启事件监听");
         _tResult = res;
         _tMinute.Value = 7;
@@ -647,8 +648,10 @@ internal sealed partial class MainForm
                 return;
             }
             var withEvents = _doc?.GetBool(false, "EventFeed", "Enabled") ?? false;
+            var hourly = HourlyEnabledInConfig();
             if (!Confirm($"将以 SYSTEM 身份注册（或覆盖）计划任务：\n\n" +
-                         $"BSTOAD-Sync：每小时第 {_tMinute.Value} 分钟，sync --apply\n" +
+                         $"BSTOAD-Sync：每小时第 {_tMinute.Value} 分钟，sync --apply" +
+                         (hourly ? "\n" : "（已暂停：注册后保持停用）\n") +
                          $"BSTOAD-FullSync：每天 {_tFullTime.Value:HH:mm}，sync --apply --full\n" +
                          (withEvents
                              ? "BSTOAD-Events：开机启动并常驻，listen --apply（安装后立即启动）\n"
@@ -657,9 +660,13 @@ internal sealed partial class MainForm
                 return;
             var minute = (int)_tMinute.Value;
             var at = _tFullTime.Value.TimeOfDay;
-            TaskAction(btns[1], () => TaskSchedulerHelper.Install(exe, minute, at, withEvents), "已安装 / 更新");
+            TaskAction(btns[1], () => TaskSchedulerHelper.Install(exe, minute, at, withEvents, hourly), "已安装 / 更新");
         };
-        btns[2].Click += (_, _) => TaskAction(btns[2], () => TaskSchedulerHelper.Enable(true), "已启用");
+        btns[2].Click += (_, _) =>
+        {
+            var hourly = HourlyEnabledInConfig();
+            TaskAction(btns[2], () => TaskSchedulerHelper.Enable(true, hourly), hourly ? "已启用" : "已启用（每小时增量按配置保持暂停）");
+        };
         btns[3].Click += (_, _) =>
         {
             if (Confirm("停用后自动同步和事件监听都将暂停，直到再次启用。确定吗？"))
@@ -678,6 +685,10 @@ internal sealed partial class MainForm
         };
         btns[7].Click += (_, _) => TaskAction(btns[7], TaskSchedulerHelper.RestartEvents, "事件监听已重启");
     }
+
+    /// <summary>配置中「保留每小时增量同步」的值（「事件订阅」页，默认保留）。</summary>
+    private bool HourlyEnabledInConfig() =>
+        _doc?.GetBool(new SyncOptions().HourlyIncrementalEnabled, "Sync", "HourlyIncrementalEnabled") ?? true;
 
     private void TaskAction(Button btn, Func<string> action, string okText)
     {

@@ -44,8 +44,10 @@ internal static class TaskSchedulerHelper
     }
 
     /// <param name="withEvents">事件订阅已启用：同时注册常驻的事件监听任务并立即启动；否则移除它。</param>
-    public static string Install(string exePath, int hourlyMinute, TimeSpan fullAt, bool withEvents)
+    /// <param name="hourlyEnabled">每小时增量是否运行；false 时仍注册 BSTOAD-Sync 但保持停用，随时可恢复。</param>
+    public static string Install(string exePath, int hourlyMinute, TimeSpan fullAt, bool withEvents, bool hourlyEnabled)
     {
+        var hourly = hourlyEnabled ? "" : "Disable-ScheduledTask -TaskName 'BSTOAD-Sync' | Out-Null";
         var exe = Ps(exePath);
         var dir = Ps(Path.GetDirectoryName(exePath)!);
         // 事件监听：开机启动 + 每 5 分钟检查一次（已在运行则忽略，意外退出后 5 分钟内自动拉起）；不限运行时长
@@ -72,6 +74,7 @@ internal static class TaskSchedulerHelper
               -Action (New-ScheduledTaskAction -Execute {{exe}} -Argument 'sync --apply' -WorkingDirectory {{dir}}) `
               -Trigger (New-ScheduledTaskTrigger -Once -At ([DateTime]::Today.AddMinutes({{hourlyMinute}})) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration ([TimeSpan]::FromDays(3650))) `
               -Settings $settings -User 'SYSTEM' -RunLevel Highest | Out-Null
+            {{hourly}}
             Register-ScheduledTask -TaskName 'BSTOAD-FullSync' -Description '北森→AD 每日全量同步+离职差集' -Force `
               -Action (New-ScheduledTaskAction -Execute {{exe}} -Argument 'sync --apply --full' -WorkingDirectory {{dir}}) `
               -Trigger (New-ScheduledTaskTrigger -Daily -At ([DateTime]::Today.Add([TimeSpan]::FromMinutes({{(int)fullAt.TotalMinutes}})))) `
@@ -82,14 +85,36 @@ internal static class TaskSchedulerHelper
         return RunChecked(script);
     }
 
-    public static string Enable(bool enable)
+    /// <param name="hourlyEnabled">启用时：每小时增量已暂停则不恢复它（BSTOAD-Sync 保持停用）。</param>
+    public static string Enable(bool enable, bool hourlyEnabled = true)
     {
         // 停用时顺带停止正在运行的事件监听（Disable 不会终止已在运行的实例）；启用时把它拉起来
         var after = enable
             ? "if(Get-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue){ Start-ScheduledTask -TaskName 'BSTOAD-Events' }"
             : "Stop-ScheduledTask -TaskName 'BSTOAD-Events' -ErrorAction SilentlyContinue";
         var verb = enable ? "Enable-ScheduledTask" : "Disable-ScheduledTask";
-        return RunChecked($"$ErrorActionPreference='Stop'; foreach($n in {AllTasksPs}){{ if(Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue){{ {verb} -TaskName $n | Out-Null }} }}; {after}; 'OK'");
+        var skipHourly = enable && !hourlyEnabled ? "if($n -eq 'BSTOAD-Sync'){ continue }; " : "";
+        return RunChecked($"$ErrorActionPreference='Stop'; foreach($n in {AllTasksPs}){{ {skipHourly}if(Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue){{ {verb} -TaskName $n | Out-Null }} }}; {after}; 'OK'");
+    }
+
+    /// <summary>
+    /// 按配置暂停 / 恢复每小时增量（只动 BSTOAD-Sync，不删除任务）。
+    /// 返回 NONE（未安装）、SAME（已是目标状态）、CHANGED（已切换）。
+    /// </summary>
+    public static string SetHourly(bool enabled)
+    {
+        var want = enabled ? "$true" : "$false";
+        var verb = enabled ? "Enable-ScheduledTask" : "Disable-ScheduledTask";
+        var output = RunPowerShell($$"""
+            $ErrorActionPreference = 'Stop'
+            $t = Get-ScheduledTask -TaskName 'BSTOAD-Sync' -ErrorAction SilentlyContinue
+            if (-not $t) { 'NONE' }
+            elseif ((($t.State -ne 'Disabled') -eq {{want}})) { 'SAME' }
+            else { {{verb}} -TaskName 'BSTOAD-Sync' | Out-Null; 'CHANGED' }
+            """, out var error);
+        foreach (var token in new[] { "CHANGED", "SAME", "NONE" })
+            if (output.Contains(token)) return token;
+        throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? output : error);
     }
 
     /// <summary>重启事件监听（让新配置生效）。任务未安装时报错。</summary>
@@ -161,6 +186,8 @@ internal static class TaskSchedulerHelper
             267009 => "正在运行",
             267011 => "尚未运行过",
             267014 => "被手动终止",
+            // 0x800710E0：已有实例在运行，本次触发被忽略（事件监听每 5 分钟的「拉起」检查，属正常）
+            2147946720 => "已在运行，本次跳过",
             _ => code,
         };
     }
