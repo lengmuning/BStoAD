@@ -11,6 +11,13 @@ namespace Bstoad.Sync;
 public interface ISyncOrchestrator
 {
     Task<SyncResult> RunOnceAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// 事件触发的增量同步：组织树照常整体对齐；员工按 windowStartUtc 起的时间窗回查北森
+    /// （与每小时增量走同一个接口、同一套决策树，只是窗口更小）。不跑离职差集。
+    /// includeEmployees=false（本批只有组织事件）时只同步组织架构。
+    /// </summary>
+    Task<SyncResult> RunEventBatchAsync(DateTime windowStartUtc, bool includeEmployees, CancellationToken ct = default);
 }
 
 public sealed class SyncOrchestrator : ISyncOrchestrator
@@ -44,16 +51,25 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
         _logger = logger;
     }
 
-    public async Task<SyncResult> RunOnceAsync(CancellationToken ct = default)
+    public Task<SyncResult> RunOnceAsync(CancellationToken ct = default)
+        => RunCoreAsync(_sync.OrgsOnly, eventWindowStartUtc: null, ct);
+
+    public Task<SyncResult> RunEventBatchAsync(DateTime windowStartUtc, bool includeEmployees, CancellationToken ct = default)
+        => RunCoreAsync(_sync.OrgsOnly || !includeEmployees, windowStartUtc, ct);
+
+    private async Task<SyncResult> RunCoreAsync(bool orgsOnly, DateTime? eventWindowStartUtc, CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var result = new SyncResult();
         var mapper = new EmployeeMapper(_adOpt);
+        // 事件触发的批次永远是小窗口增量：不全量、不跑离职差集（差集只能在全量时安全执行）
+        var fullPull = eventWindowStartUtc == null && _sync.FullPull;
 
-        var scope = _sync.OrgsOnly ? "仅组织架构" : _sync.UsersOnly ? "仅人员" : "组织+人员";
+        var scope = orgsOnly ? "仅组织架构" : _sync.UsersOnly ? "仅人员" : "组织+人员";
+        if (eventWindowStartUtc != null) scope = "事件触发·" + scope;
         _logger.LogInformation(
             "================ 同步开始 范围={Scope} DryRun={DryRun} FullPull={Full} ReconcileLeavers={Recon} ================",
-            scope, _sync.DryRun, _sync.FullPull, _sync.ReconcileLeavers);
+            scope, _sync.DryRun, fullPull, _sync.ReconcileLeavers);
 
         _logger.LogInformation("[1/6] 取 Beisen access_token");
         await _tokenProvider.GetAccessTokenAsync(ct);
@@ -109,9 +125,11 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             _logger.LogInformation("  发现已锚定 OU {Count} 个", orgIdToDn.Count);
         }
 
-        if (_sync.OrgsOnly)
+        if (orgsOnly)
         {
-            _logger.LogInformation("[4-6/6] --orgs-only：跳过员工拉取/应用/离职差集");
+            _logger.LogInformation(eventWindowStartUtc != null
+                ? "[4-6/6] 本批只有组织事件：跳过员工拉取/应用/离职差集"
+                : "[4-6/6] --orgs-only：跳过员工拉取/应用/离职差集");
             sw.Stop();
             result.Duration = sw.Elapsed;
             _logger.LogInformation(
@@ -121,17 +139,21 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
             return result;
         }
 
-        _logger.LogInformation("[4/6] 拉取员工 {Mode}",
-            _sync.FullPull ? "全量（FullPullStartDate 起分片）" : $"时间窗最近 {_sync.InitialBackfillDays} 天");
         var stop = DateTime.UtcNow.AddSeconds(-_sync.TimeWindowSafetyOffsetSeconds);
-        var emps = _sync.FullPull
+        var windowStart = eventWindowStartUtc ?? stop.AddDays(-_sync.InitialBackfillDays);
+        if (windowStart >= stop) windowStart = stop.AddMinutes(-10);
+        _logger.LogInformation("[4/6] 拉取员工 {Mode}",
+            fullPull ? "全量（FullPullStartDate 起分片）"
+            : eventWindowStartUtc != null ? $"事件时间窗 {windowStart.ToLocalTime():yyyy-MM-dd HH:mm:ss} 起"
+            : $"时间窗最近 {_sync.InitialBackfillDays} 天");
+        var emps = fullPull
             ? await _empClient.SearchAllAsync(includeDeleted: true, ct)
-            : await _empClient.SearchByTimeWindowAsync(stop.AddDays(-_sync.InitialBackfillDays), stop, includeDeleted: true, ct);
+            : await _empClient.SearchByTimeWindowAsync(windowStart, stop, includeDeleted: true, ct);
         result.EmployeesFetched = emps.Count;
 
         // 拉取量哨兵：全量员工数骤降视为数据源异常，本轮拒绝跑差集
         var pullSuspect = false;
-        if (_sync.FullPull)
+        if (fullPull)
         {
             var last = ReadLastFullPullCount();
             if (last > 0 && emps.Count < last * _sync.MinPullRatioVsLastRun)
@@ -226,7 +248,7 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
         }
         else if (adReady && _sync.ReconcileLeavers)
         {
-            if (!_sync.FullPull)
+            if (!fullPull)
             {
                 _logger.LogWarning("[6/6] 跳过离职差集：仅在 FullPull=true 时安全执行（增量窗口不能跑差集）");
             }
@@ -252,7 +274,7 @@ public sealed class SyncOrchestrator : ISyncOrchestrator
         AppendStats(result);
 
         // 全量、无过滤的运行才代表「全貌」，写出待处理清单供图形界面展示
-        if (_sync.FullPull && !_sync.UsersOnly && only == null && !_sync.LeaversOnly)
+        if (fullPull && !_sync.UsersOnly && only == null && !_sync.LeaversOnly)
             WritePendingReport(result);
 
         return result;

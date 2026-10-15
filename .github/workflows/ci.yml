@@ -1,0 +1,29 @@
+name: CI
+
+# 推送到 main 或提交 PR 时编译检查（与 Release 相同的发布参数），确保打 tag 前能编译通过
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build solution
+        run: dotnet build BSTOAD.sln -c Release
+
+      - name: Publish single-file exe (same as release)
+        run: >
+          dotnet publish src/Bstoad.Worker -c Release -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -o publish

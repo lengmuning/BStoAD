@@ -1,6 +1,6 @@
 namespace Bstoad.Worker;
 
-public enum CommandKind { Sync, MatchAd, MigrateMarker, InitConfig, ProtectConfig, Gui, TestAlert }
+public enum CommandKind { Sync, MatchAd, MigrateMarker, InitConfig, ProtectConfig, Gui, TestAlert, Listen }
 
 public sealed class CommandContext
 {
@@ -34,6 +34,7 @@ public sealed class CommandContext
                 case "protect-config": cmd = CommandKind.ProtectConfig; break;
                 case "gui": cmd = CommandKind.Gui; break;
                 case "test-alert": cmd = CommandKind.TestAlert; break;
+                case "listen": cmd = CommandKind.Listen; break;
                 case "--apply": apply = true; break;
                 case "--full": full = true; break;
                 case "--orgs-only": orgsOnly = true; break;
@@ -87,6 +88,12 @@ BSTOAD · 北森 → AD 同步
       --leavers-only 只处理离职员工（离职人员部门/离职状态），在职全部跳过
                     ← 先归档禁用存量离职人员用；建议配合 --full
 
+  bstoad listen [--apply] [--only 工号[,工号...]]
+      事件监听（常驻）：从事件服务拉取北森事件，有变动时自动增量同步到 AD
+      需先在配置 EventFeed 段（图形界面「事件订阅」页）启用并填写地址和令牌
+      由计划任务 BSTOAD-Events 开机自启；与定时同步共用同一把锁，不会并发写 AD
+      不加 --apply 为干跑（只打印决策、不保存处理进度）；--only 用于试点
+
   bstoad match-ad [--apply]
       上线前预匹配：P1 SAM=工号 / P2 邮箱 → 回填 employeeID 到老账号
       仅回填 employeeID，不打纳管标记
@@ -101,7 +108,7 @@ BSTOAD · 北森 → AD 同步
       单文件分发时的第一步
 
   bstoad protect-config
-      用 DPAPI(本机) 加密配置里的密钥、密码、告警 Webhook 并写回
+      用 DPAPI(本机) 加密配置里的密钥、密码、告警 Webhook、事件服务令牌并写回
       加密后文件被拷走也无法解密；换服务器需重填明文再跑一次
 
   bstoad gui        打开图形界面（直接双击 exe 也会打开）

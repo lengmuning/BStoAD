@@ -618,7 +618,8 @@ internal sealed partial class MainForm
         _tFullTime = fb.Custom("全量同步",
             new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 100 },
             "每天这个时间运行，含离职对账，建议放在夜间");
-        var (btns, res) = fb.Actions("刷新状态", "安装 / 更新任务", "启用", "停用", "立即运行增量", "立即运行全量", "卸载任务");
+        fb.Hint("「事件订阅」页启用后，安装时会一并注册常驻的事件监听任务 BSTOAD-Events（开机自启、意外退出 5 分钟内自动拉起）。");
+        var (btns, res) = fb.Actions("刷新状态", "安装 / 更新任务", "启用", "停用", "立即运行增量", "立即运行全量", "卸载任务", "重启事件监听");
         _tResult = res;
         _tMinute.Value = 7;
         _tFullTime.Value = DateTime.Today.AddHours(2);
@@ -640,18 +641,28 @@ internal sealed partial class MainForm
         btns[0].Click += (_, _) => RefreshTasks();
         btns[1].Click += (_, _) =>
         {
-            if (!Confirm($"将以 SYSTEM 身份注册（或覆盖）两个计划任务：\n\n" +
+            if (_dirty)
+            {
+                ShowError("配置有未保存的修改，请先保存再安装任务（是否注册事件监听取决于已保存的「事件订阅」设置）。");
+                return;
+            }
+            var withEvents = _doc?.GetBool(false, "EventFeed", "Enabled") ?? false;
+            if (!Confirm($"将以 SYSTEM 身份注册（或覆盖）计划任务：\n\n" +
                          $"BSTOAD-Sync：每小时第 {_tMinute.Value} 分钟，sync --apply\n" +
-                         $"BSTOAD-FullSync：每天 {_tFullTime.Value:HH:mm}，sync --apply --full\n\n程序：{exe}\n\n确定吗？"))
+                         $"BSTOAD-FullSync：每天 {_tFullTime.Value:HH:mm}，sync --apply --full\n" +
+                         (withEvents
+                             ? "BSTOAD-Events：开机启动并常驻，listen --apply（安装后立即启动）\n"
+                             : "（事件订阅未启用：不注册事件监听，已有的 BSTOAD-Events 会被移除）\n") +
+                         $"\n程序：{exe}\n\n确定吗？"))
                 return;
             var minute = (int)_tMinute.Value;
             var at = _tFullTime.Value.TimeOfDay;
-            TaskAction(btns[1], () => TaskSchedulerHelper.Install(exe, minute, at), "已安装 / 更新");
+            TaskAction(btns[1], () => TaskSchedulerHelper.Install(exe, minute, at, withEvents), "已安装 / 更新");
         };
         btns[2].Click += (_, _) => TaskAction(btns[2], () => TaskSchedulerHelper.Enable(true), "已启用");
         btns[3].Click += (_, _) =>
         {
-            if (Confirm("停用后自动同步将暂停，直到再次启用。确定吗？"))
+            if (Confirm("停用后自动同步和事件监听都将暂停，直到再次启用。确定吗？"))
                 TaskAction(btns[3], () => TaskSchedulerHelper.Enable(false), "已停用");
         };
         btns[4].Click += (_, _) => TaskAction(btns[4], () => TaskSchedulerHelper.StartNow(TaskSchedulerHelper.SyncTask), "已触发增量同步，稍后刷新查看结果");
@@ -662,9 +673,10 @@ internal sealed partial class MainForm
         };
         btns[6].Click += (_, _) =>
         {
-            if (Confirm("卸载后不再自动同步（程序和配置文件保留）。确定吗？"))
+            if (Confirm("卸载后不再自动同步，事件监听也会停止（程序和配置文件保留）。确定吗？"))
                 TaskAction(btns[6], () => TaskSchedulerHelper.Uninstall(), "已卸载");
         };
+        btns[7].Click += (_, _) => TaskAction(btns[7], TaskSchedulerHelper.RestartEvents, "事件监听已重启");
     }
 
     private void TaskAction(Button btn, Func<string> action, string okText)

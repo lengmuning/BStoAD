@@ -47,6 +47,7 @@ internal sealed partial class MainForm : Form
         BuildAdTab();
         BuildSyncTab();
         BuildAlertTab();
+        BuildEventTab();
         BuildRunTab();
         BuildPendingTab();
         BuildStatsTab();
@@ -63,7 +64,10 @@ internal sealed partial class MainForm : Form
         bottom.Controls.Add(_saveBtn);
         bottom.Controls.Add(_revertBtn);
         bottom.Controls.Add(_status);
-        _saveBtn.Click += (_, _) => SaveConfig();
+        _saveBtn.Click += (_, _) =>
+        {
+            if (SaveConfig()) OfferListenerRestart();
+        };
         _revertBtn.Click += (_, _) =>
         {
             if (!_dirty || Confirm("放弃所有未保存的修改，重新读取配置文件？")) LoadConfig();
@@ -240,6 +244,7 @@ internal sealed partial class MainForm : Form
             LoadAd();
             LoadSync();
             LoadAlerts();
+            LoadEvents();
             foreach (var (box, path) in _secretPaths)
             {
                 box.Text = "";
@@ -278,6 +283,7 @@ internal sealed partial class MainForm : Form
         CollectAd();
         CollectSync();
         CollectAlerts();
+        CollectEvents();
 
         foreach (var (box, path) in _secretPaths)
         {
@@ -342,6 +348,7 @@ internal sealed partial class MainForm : Form
             if (!LooksLikeDn(line)) p.Add("禁区中有一行不像有效的 DN：" + line.Trim());
         if (_alEnabled.Checked && !_wcOn.Checked && !_dtOn.Checked && !_fsOn.Checked)
             p.Add("已启用告警，但没有启用任何渠道");
+        ValidateEvents(p);
         return p;
     }
 

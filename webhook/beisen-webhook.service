@@ -1,0 +1,25 @@
+[Unit]
+Description=Beisen HR event receiver on 8600 (feed API on 8601)
+After=network.target
+[Service]
+Type=simple
+User=beisen-webhook
+Group=beisen-webhook
+EnvironmentFile=/etc/beisen-webhook.env
+LogNamespace=beisen-webhook
+ExecStart=/usr/bin/python3 /opt/beisen-webhook/server.py
+Restart=on-failure
+RestartSec=3
+StateDirectory=beisen-webhook
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=128M
+CPUQuota=25%
+TasksMax=32
+LimitNOFILE=256
+[Install]
+WantedBy=multi-user.target

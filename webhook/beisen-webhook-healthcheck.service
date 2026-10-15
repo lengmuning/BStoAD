@@ -1,0 +1,23 @@
+[Unit]
+Description=Health check and alerting for beisen-webhook (8600)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/beisen-webhook-alert.env
+LogNamespace=beisen-webhook
+ExecStart=/usr/bin/python3 /opt/beisen-webhook/healthcheck.py
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
+StateDirectory=beisen-webhook-healthcheck
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=64M
+CPUQuota=10%
+TasksMax=8
+TimeoutStartSec=60
+LogLevelMax=notice

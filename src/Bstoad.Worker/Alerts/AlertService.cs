@@ -10,7 +10,8 @@ namespace Bstoad.Worker.Alerts;
 public interface IAlertService
 {
     /// <summary>同步结束后调用。永不抛异常：告警失败只记日志，不影响同步结果与退出码。</summary>
-    Task NotifyAsync(SyncResult? result, Exception? fatal, CancellationToken ct = default);
+    /// <param name="mode">消息里显示的运行方式（如「事件触发」）；为空时按配置显示「全量」/「增量」。</param>
+    Task NotifyAsync(SyncResult? result, Exception? fatal, CancellationToken ct = default, string? mode = null);
 }
 
 public sealed class AlertService : IAlertService
@@ -30,7 +31,7 @@ public sealed class AlertService : IAlertService
         _logger = logger;
     }
 
-    public async Task NotifyAsync(SyncResult? result, Exception? fatal, CancellationToken ct = default)
+    public async Task NotifyAsync(SyncResult? result, Exception? fatal, CancellationToken ct = default, string? mode = null)
     {
         try
         {
@@ -61,7 +62,7 @@ public sealed class AlertService : IAlertService
             var title = fresh.Any(e => e.Level == SyncEventLevel.Critical) ? $"{_opt.Title} · 严重告警"
                       : fresh.Count > 0 ? $"{_opt.Title} · 需要关注"
                       : $"{_opt.Title} · 同步汇总";
-            var body = Compose(result, fresh, relevant.Count - fresh.Count, events, summary);
+            var body = Compose(result, fresh, relevant.Count - fresh.Count, events, summary, mode);
 
             var results = await _sender.SendAsync(_opt, title, body, ct);
             foreach (var r in results)
@@ -86,13 +87,14 @@ public sealed class AlertService : IAlertService
         }
     }
 
-    private string Compose(SyncResult? r, List<SyncEvent> fresh, int suppressed, List<SyncEvent> all, bool summary)
+    private string Compose(SyncResult? r, List<SyncEvent> fresh, int suppressed, List<SyncEvent> all, bool summary, string? mode)
     {
         var sb = new StringBuilder();
-        var mode = _sync.FullPull ? "全量" : "增量";
+        mode ??= _sync.FullPull ? "全量" : "增量";
         sb.AppendLine($"时间：{DateTime.Now:yyyy-MM-dd HH:mm}（{mode}{(_sync.DryRun ? "·干跑" : "")}）");
         sb.AppendLine($"服务器：{Environment.MachineName}");
-        if (r != null)
+        // 事件监听自身的告警（如连不上事件服务）不是一次同步，没有概况可言
+        if (r != null && (r.OrgsFetched > 0 || r.EmployeesFetched > 0 || r.Failures > 0))
             sb.AppendLine($"概况：新建 {r.UsersCreated} · 更新 {r.UsersUpdated} · 移动 {r.UsersMoved} · 禁用 {r.UsersDisabled + r.LeaversReconciled} · 失败 {r.Failures}");
 
         foreach (var level in new[] { SyncEventLevel.Critical, SyncEventLevel.Warning, SyncEventLevel.Info })
